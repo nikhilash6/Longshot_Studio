@@ -9,7 +9,7 @@ never thrown away.
 - Works the same way as ComfyUI Minimax H3 workflow, using references to generate video.
 - Join each Shot to its neighbours with **Continuous** (flowing on), **Bridge**
   (pinned at both ends), **Context** (a new angle with the last frame as a reference)
-  or **Cut**.
+  or **Cut**(a completely new shot with the references).
 - Frame anchors: set first or last-frame images at any join.
 - Multi-take renders with seed control, a render queue across different projects, and automatic
   recovery when ComfyUI runs out of memory.
