@@ -1,4 +1,32 @@
 # H3 Long Shot Studio
+
+A browser studio for making long AI videos with MiniMax H3, shot by shot. It runs inside
+ComfyUI at `/longshot`. Build a film from short Shots, review and approve each one, and
+the Studio stitches them into one continuous take or a cut sequence. Approved work is
+never thrown away.
+
+**Generate**
+- Works the same way as ComfyUI Minimax H3 workflow, using references to generate video.
+- Join each Shot to its neighbours with **Continuous** (flowing on), **Bridge**
+  (pinned at both ends), **Context** (a new angle with the last frame as a reference)
+  or **Cut**.
+- Frame anchors: set first or last-frame images at any join.
+- Multi-take renders with seed control, a render queue across different projects, and automatic
+  recovery when ComfyUI runs out of memory.
+- Optional song-driven lip sync and voice reference.
+
+**Edit**
+- A timeline with one block per Shot: switch takes instantly, stitch the seam when generating continuous shots, approve
+  or reroll any Shot **in place** while its neighbours keep their takes.
+- Insert, reorder, bypass or remove Shots anywhere, including before Shot 1.
+- Drop in video clips as Shots, bridged into the generated footage or hard-cut.
+- Take history for every Shot. Nothing samples again unless it has to.
+
+**Deliver**
+- Export approved clips (plain or RTX Super Resolution upscaled, incremental).
+- Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
+- Export or import a whole project as one .zip.
+
 <img width="2192" height="1338" alt="image" src="https://github.com/user-attachments/assets/a4574e50-346c-4ebf-b4c2-5d6ed81e827c" />
 
 ## What's new in 0.8.2
