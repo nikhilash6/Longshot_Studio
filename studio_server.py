@@ -79,8 +79,8 @@ def is_local_request(remote, headers) -> bool:
 
 def folder_for(which, output_dir, input_dir, project=None, subfolder=None):
     """The only folders open-folder may open. Never a path from the browser:
-    the project slug only picks input/longshot/<slug> or the project's videos
-    folder (output/longshot/<slug>/videos) when that folder exists."""
+    the project slug only picks input/longshot/<slug> or the project's videos,
+    Approved_Clips or clips folder (output/longshot/<slug>/...) when it exists."""
     if which == "output":
         base = os.path.join(output_dir, gb.OUTPUT_SUBFOLDER)
         if pj.is_slug(project):
@@ -91,6 +91,13 @@ def folder_for(which, output_dir, input_dir, project=None, subfolder=None):
             approved = pj.approved_folder(output_dir, project)
             if sub == pj.approved_subfolder(project) and os.path.isdir(approved):
                 return approved
+            if sub == pj.clips_subfolder(project):
+                clips = pj.clips_folder(output_dir, project)
+                if os.path.isdir(clips):
+                    return clips
+                own = os.path.join(base, project)
+                if os.path.isdir(own):
+                    return own
         return base
     if which == "input":
         if pj.is_slug(project):
@@ -232,6 +239,16 @@ def video_formats():
     if not nvenc_available():
         formats = [f for f in formats if "nvenc" not in f]
     return formats
+
+
+def _timeline_has_context():
+    """Long Shot 1.6.8's Timeline Shot takes a context_image."""
+    try:
+        import nodes as comfy_nodes
+        cls = comfy_nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3TimelineShot")
+        return cls is None or "context_image" in (cls.INPUT_TYPES().get("optional") or {})
+    except Exception:
+        return True
 
 
 def current_env():
@@ -821,6 +838,11 @@ def register(routes=None):
             except Exception:
                 lists[kind] = []
         project = resolve_names(body.get("project") or {}, lists)
+        context_notes = []
+        if not body.get("take_clips") and not body.get("export_clips"):
+            context_notes = await asyncio.get_running_loop().run_in_executor(
+                None, add_context_frames, project, bool(body.get("dry_run")), body.get("upto"),
+                bool(body.get("standalone")))
         try:
             if isinstance(body.get("take_clips"), list):
                 built = gb.build_take_clips(project, body["take_clips"][:64], env=current_env())
@@ -835,7 +857,52 @@ def register(routes=None):
                                         chunk=body.get("chunk") if isinstance(body.get("chunk"), dict) else None)
         except gb.BuildError as err:
             return error(err)
-        return web.json_response(built.as_dict())
+        out = built.as_dict()
+        if context_notes:
+            out["warnings"] = list(out.get("warnings") or []) + context_notes
+        return web.json_response(out)
+
+    def add_context_frames(project, dry_run, upto=None, standalone=False):
+        """Context Continuity Shots that render get the last frame of the Shot
+        before them (made from its take's clip). Returns warnings for those
+        that can't have it yet."""
+        import folder_paths
+        shots = [x for x in project.get("shots") or [] if isinstance(x, dict) and not x.get("bypassed")]
+        notes = []
+        if any(x.get("join") == "context" for x in shots) and not _timeline_has_context():
+            raise_build = "Context Continuity needs H3 Long Shot 1.6.8 or later. Update it, then restart ComfyUI."
+            notes.append(raise_build)
+            for x in shots:
+                if x.get("join") == "context":
+                    x["join"] = "cut"
+            return notes
+        ffmpeg = None
+        ids = [x.get("id") for x in shots]
+        last = ids.index(upto) if upto in ids else len(shots) - 1     # what this run renders
+        for i, sh in enumerate(shots):
+            if i > last or (standalone and i != last):
+                continue
+            if sh.get("join") != "context" or sh.get("kind") == "clip" or sh.get("lock") or i == 0:
+                continue
+            prev = shots[i - 1]
+            if prev.get("kind") != "clip" and (prev.get("status") == "queued" or not prev.get("take")):
+                if not dry_run:
+                    notes.append(f"Shot {i + 1} (Context): the Shot before it has no take yet, so it "
+                                 "renders without its last frame.")
+                continue
+            ffmpeg = ffmpeg or _ffmpeg_path()
+            if not ffmpeg:
+                notes.append("ffmpeg isn't available: Context Shots render without the frame before.")
+                break
+            slug = gb.project_slug(project)
+            info = pj.context_frame(folder_paths.get_output_directory(), folder_paths.get_input_directory(),
+                                    slug, prev, ffmpeg=ffmpeg)
+            if info:
+                sh["context_image"] = info
+            elif not dry_run:
+                notes.append(f"Shot {i + 1} (Context): the take before it has no clip yet (Make missing "
+                             "clips under the timeline), so it renders without its last frame.")
+        return notes
 
     def local(request):
         return is_local_request(request.remote, request.headers)

@@ -305,7 +305,7 @@ kbd { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .confirm-wrap { z-index: 15; }
 .confirm { max-width: 460px; }
 .confirm h3 { margin: 0; font-size: 17px; }
-.confirm p { margin: 0; color: var(--sub); }
+.confirm p { margin: 0; color: var(--sub); white-space: pre-line; }
 
 /* lightbox */
 .lightbox { position: fixed; inset: 0; z-index: 14; background: rgba(5,5,6,.92); display: flex; flex-direction: column; padding: 16px 20px; gap: 10px; }
@@ -620,6 +620,18 @@ kbd { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .change-note .cn-x { background: none; border: 0; padding: 2px; color: var(--muted); cursor: pointer; display: inline-flex; }
 .change-note .cn-x:hover { color: var(--text); }
 
+/* Seed field: drag left / right to change it */
+[data-base-seed] { cursor: ew-resize; }
+[data-base-seed]:focus { cursor: text; }
+body.seed-dragging, body.seed-dragging * { cursor: ew-resize !important; user-select: none !important; }
+
+/* How a Shot joins the one before: Continuous / Context / Cut */
+.join-chip { align-self: center; font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid #33363C;
+  background: transparent; color: var(--muted); white-space: nowrap; cursor: pointer; margin-right: 4px; }
+.join-chip:hover { color: var(--text); border-color: var(--muted); }
+.join-chip.j-context { color: #8FD3F0; border-color: #2C5266; background: rgba(143,211,240,.07); }
+.join-chip.j-cut { color: #FFB4A8; border-color: #6B2E2E; }
+
 /* Render queue */
 .q-btns { display: inline-flex; gap: 6px; }
 .queue { display: flex; flex-direction: column; gap: 4px; max-height: 420px; overflow: auto; }
@@ -657,3 +669,16 @@ kbd { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .panel.folded .peek { border-top: 0; }
 .panel.folded .q-empty.peek, .panel.folded .plan-row.peek > span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #shots-panel.has-anchors .first-row { margin-left: var(--anchor-w); }
+
+/* Style & Sound and Shot prompt boxes grow with their text */
+textarea.fit { resize: none; overflow: hidden; line-height: 1.5; }
+
+/* Upscale settings fold to the switch and its name (kept per browser) */
+.vsr-fold { width: auto; flex: 1 1 auto; justify-content: flex-start; gap: 6px; font-size: 13px; text-align: left; }
+.vsr-zone .vsr-text { flex-basis: 100%; }
+.vsr-zone.folded .vsr-text, .vsr-zone.folded .lbl-row { display: none; }
+.vsr-zone.folded .fold-ch { transform: rotate(-90deg); }
+
+/* join chip with one choice (no approved Shot next to it): Cut, quiet */
+.join-chip.only { opacity: .6; }
+.join-chip.only:hover { opacity: .85; }

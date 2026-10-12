@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.7.7"
+STUDIO_VERSION = "0.8.2"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -395,6 +395,54 @@ def videos_subfolder(slug):
 # ---------------------------------------------------------------------------
 
 CLIP_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,160}")
+
+
+CONTEXT_DIR = "context"
+_TAKE_FILE_RE = re.compile(r"[A-Za-z0-9_-]{1,160}\.safetensors")
+
+
+def context_frame(output_dir, input_dir, slug, prev, ffmpeg="ffmpeg", run=None):
+    """Context Continuity: the last frame of the Shot before (its take's clip,
+    or a Clip Shot's video at its trim) as a PNG in the project's input folder,
+    made once per take. Returns {file, subfolder} or None when there's nothing
+    to take it from yet (no take, or no clip for it)."""
+    import subprocess
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, timeout=120))
+    if not is_slug(slug) or not isinstance(prev, dict):
+        return None
+    sub = f"{project_input_subfolder(slug)}/{CONTEXT_DIR}"
+    folder = os.path.join(input_dir, *sub.split("/"))
+    if prev.get("kind") == "clip":
+        c = prev.get("clip") or {}
+        src = None
+        try:
+            src = os.path.join(input_dir, *_clean_subfolder(c.get("subfolder", "")).split("/"), c.get("file") or "")
+        except ValueError:
+            return None
+        if not c.get("file") or not os.path.isfile(src):
+            return None
+        end = (float(c.get("trim_in") or 0) + float(c.get("frames") or 0) / 24.0) - 1.0 / 24.0
+        key = "clip_" + hashlib.sha256(f"{c.get('file')}|{c.get('sha256')}|{end:.4f}".encode()).hexdigest()[:16]
+        cmd_in = ["-ss", f"{max(0.0, end):.4f}", "-i", src, "-frames:v", "1"]
+    else:
+        take = str(prev.get("take") or "")
+        if not _TAKE_FILE_RE.fullmatch(take):
+            return None
+        key = take[:-len(".safetensors")]
+        src = os.path.join(clips_folder(output_dir, slug), key + ".mp4")
+        if not os.path.isfile(src):
+            return None
+        cmd_in = ["-sseof", "-1", "-i", src, "-update", "1"]
+    name = f"{key}_last.png"
+    dest = os.path.join(folder, name)
+    if not os.path.isfile(dest) or os.path.getmtime(dest) < os.path.getmtime(src):
+        os.makedirs(folder, exist_ok=True)
+        tmp = dest + ".part.png"
+        res = run([ffmpeg, "-y", "-v", "error", *cmd_in, tmp])
+        if getattr(res, "returncode", 1) != 0 or not os.path.isfile(tmp):
+            return None
+        os.replace(tmp, dest)
+    return {"file": name, "subfolder": sub}
 
 
 def clips_folder(output_dir, slug):

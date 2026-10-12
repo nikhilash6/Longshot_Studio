@@ -49,6 +49,11 @@ function toggleFold(k) {
   f[k] = !f[k];
   store("h3studio.folds", JSON.stringify(f));
   applyFolds();
+  if (k === "vsr") renderSettings();
+}
+/** Is this zone folded in this browser? (Plan, Queue, the Upscale settings) */
+function folded(k) {
+  try { return !!(JSON.parse(store("h3studio.folds") || "{}") || {})[k]; } catch (e) { return false; }
 }
 
 const CLIENT_ID = (() => {
@@ -105,6 +110,9 @@ function normalize(p) {
     task_types: ["reference generation"] }, p.style || {});
   p.shots = (p.shots || []).map((s) => ({ id: s.id || uid("s"), text: s.text || "",
     seconds: Number(s.seconds) || 5, shot_seed: s.shot_seed ?? -1, bypassed: !!s.bypassed,
+    // a Shot on auto stays on auto: the seed its take used, and a one-off seed for its next render
+    seed_used: hasSeed(s.seed_used) ? Number(s.seed_used) : null,
+    seed_pending: hasSeed(s.seed_pending) ? Number(s.seed_pending) : null,
     status: ["approved", "review", "queued"].includes(s.status) ? s.status : "queued",
     was_approved: !!s.was_approved, was_rendered: !!s.was_rendered,
     prev_seeds: Array.isArray(s.prev_seeds) ? s.prev_seeds.slice(-10) : [],
@@ -113,7 +121,8 @@ function normalize(p) {
     rendered: s.rendered && typeof s.rendered === "object" ? s.rendered
       : s.take && s.status !== "queued" ? { text: s.text || "", seconds: Number(s.seconds) || 5, seed: s.shot_seed ?? -1 } : null,
     edit_from: s.edit_from && typeof s.edit_from === "object" ? Object.assign({}, s.edit_from, { gen: 0 }) : null,
-    join: s.join === "cut" ? "cut" : "bridge",
+    join: s.join === "cut" || s.join === "context" ? s.join : "bridge",
+    context_from: s.context_from || null,     // Context: the take of the Shot before it was rendered from
     kind: s.kind === "clip" ? "clip" : "shot",
     standalone: !!s.standalone && s.kind !== "clip",   // its take was rendered on its own (no pins)
     seam: ["ok", "mismatch"].includes(s.seam) ? s.seam : null,   // its left join, as last known
@@ -163,10 +172,68 @@ function nextToRender() {
 /** A join that's a hard cut: the seam Long Shot reported for this Shot's left
  *  join in the last render that had both Shots (remembered on the Shot, since a
  *  standalone render shows only one Shot). */
+/** Not continued from the Shot before: a Cut, or Context (a cut that takes the
+ *  last frame of the Shot before as a reference picture). */
+const isCut = (s) => !!s && (s.join === "cut" || s.join === "context");
+
+/** The join chip (0.8.2): how ▶ renders a Shot, offered by the approved Shots
+ *  right next to it (clips count as approved).
+ *    none            → Cut (standalone)
+ *    before only     → Cut, Context, Continuous (from the Shot before)
+ *    after only      → Cut, Continuous (into the Shot after)
+ *    before + after  → Cut, Context, Bridge (pinned at both ends)
+ *  The choice is kept in s.join ("cut" | "context" | "bridge"); a choice not on
+ *  offer shows (and renders) as Cut. Render all and the main button still read
+ *  s.join as the join with the Shot before, as they always have. */
+function chipSides(s) {
+  const act = active(), i = act.indexOf(s);
+  const ok = (x) => !!x && (x.kind === "clip" || (x.status === "approved" && !!x.take));
+  return { prev: i > 0 && ok(act[i - 1]) ? act[i - 1] : null, next: i >= 0 && ok(act[i + 1]) ? act[i + 1] : null };
+}
+function chipOptions(s) {
+  const { prev, next } = chipSides(s);
+  if (prev) return ["bridge", "context", "cut"];
+  if (next) return ["bridge", "cut"];
+  return ["cut"];
+}
+function chipJoin(s) {
+  const j = s.join || "bridge";
+  return chipOptions(s).includes(j) ? j : "cut";
+}
+function chipName(s, j = chipJoin(s)) {
+  if (j === "bridge") { const { prev, next } = chipSides(s); return prev && next ? "Bridge" : "Continuous"; }
+  return j === "context" ? "Context" : "Cut";
+}
+/** What ▶ does for Shot s, worked out when the render starts:
+ *  { alone } a standalone render (Cut, Context), or { joins } the joins sent
+ *  for this render only (the Shot's start and its next Shot's start). */
+function chipPlan(s) {
+  const j = chipJoin(s);
+  if (j !== "bridge") return { alone: true, name: chipName(s, j) };
+  const { prev, next } = chipSides(s);
+  const act = active(), i = act.indexOf(s), nx = act[i + 1];
+  const joins = { [s.id]: prev ? "bridge" : "cut" };
+  if (nx && isRendered(nx)) joins[nx.id] = next ? "bridge" : "cut";
+  return { alone: false, joins, prev, next, name: chipName(s, j) };
+}
+/** After a chip render: a join this render left as a hard cut, though the
+ *  Shot's own chip says otherwise, shows as a hard cut. */
+function chipSeams(plan, id) {
+  const act = active(), s = act.find((x) => x.id === id);
+  if (!s || !plan || plan.alone) return;
+  const i = act.indexOf(s), pv = act[i - 1], nx = act[i + 1];
+  if (plan.joins[s.id] === "cut" && !isCut(s)) {
+    s.standalone = i > 0;
+    s.seam = pv && isRendered(pv) && pv.kind !== "clip" ? "mismatch" : null;
+  }
+  if (nx && plan.joins[nx.id] === "cut" && !isCut(nx) && nx.kind !== "clip") nx.seam = "mismatch";
+  if (nx && plan.joins[nx.id] === "bridge" && nx.kind !== "clip") nx.seam = "ok";
+}
+
 function cutBefore(s) {
   if (!s || s.bypassed || s.status === "queued") return false;
   const act = active(), prev = act[act.indexOf(s) - 1];
-  if (!prev || s.join === "cut" || prev.kind === "clip" || s.kind === "clip" || prev.status === "queued") return false;
+  if (!prev || isCut(s) || prev.kind === "clip" || s.kind === "clip" || prev.status === "queued") return false;
   const row = lastRowFor(s.id), lo = last();
   if (row && lo && lo.chain.includes(prev.id) && row.seam) return row.seam === "mismatch";
   return s.seam === "mismatch";
@@ -184,8 +251,8 @@ function noteSeams(rows, chain, standalone) {
     // a fresh take: nothing leads into it, and the Shot after it no longer follows on
     const act = active(), sh = byId.get(chain[0]), i = act.indexOf(sh);
     const prev = act[i - 1], next = act[i + 1];
-    sh.seam = prev && isRendered(prev) && prev.kind !== "clip" && sh.join !== "cut" ? "mismatch" : null;
-    if (next && next.kind !== "clip" && next.status !== "queued" && next.join !== "cut") next.seam = "mismatch";
+    sh.seam = prev && isRendered(prev) && prev.kind !== "clip" && !isCut(sh) ? "mismatch" : null;
+    if (next && next.kind !== "clip" && next.status !== "queued" && !isCut(next)) next.seam = "mismatch";
   }
 }
 /** A run of the open project is going (another project's run doesn't lock this one). */
@@ -674,22 +741,44 @@ function freshSeed(s) {
   return seedIncrements() ? takeCounterSeed(s) : Math.floor(Math.random() * (SEED_MAX + 1));
 }
 
-/** When a render starts: the Shots on auto it samples take their seeds now
- *  (Increment: off the counter, which moves up; Fixed: the seed). Returns an
- *  undo for a render that couldn't start. */
-function claimAutoSeeds(ids) {
-  const p = P(), before = p.settings.seed, set = [];
-  for (const id of ids) {
-    const s = p.shots.find((x) => x.id === id);
-    if (!s || s.bypassed || s.kind === "clip" || Number(s.shot_seed) >= 0) continue;
-    s.shot_seed = seedIncrements(p) ? takeCounterSeed(null) : (Number(p.settings.seed) || 0);
-    set.push(s);
-  }
-  return () => { p.settings.seed = before; for (const s of set) s.shot_seed = -1; };
+/** A real seed (0 or more): null / undefined / "" aren't. */
+const hasSeed = (x) => x !== null && x !== undefined && x !== "" && Number(x) >= 0;
+
+/** A Shot's seed: the one typed in (fixed), or the one its current take used (auto). */
+const effSeed = (s) => (Number(s.shot_seed) >= 0 ? Number(s.shot_seed) : hasSeed(s.seed_used) ? Number(s.seed_used) : null);
+const isAuto = (s) => !(Number(s.shot_seed) >= 0);
+
+/** A Shot about to render again with a new seed (reroll, bridge, another take,
+ *  Multi-take). A typed seed changes (it stays typed); a Shot on auto stays on
+ *  auto: Increment gives it the counter when it starts, Fixed a one-off random
+ *  seed (the fixed seed would give the same take). */
+function reseed(s, job = null) {
+  if (!isAuto(s)) { s.shot_seed = job ? passSeed(job, s) : freshSeed(s); return; }
+  s.seed_pending = seedIncrements() ? null : Math.floor(Math.random() * (SEED_MAX + 1));
 }
 
-function sendable(project) {
+/** When a render starts: the seeds of the Shots on auto it samples (Increment:
+ *  off the counter, which moves up; Fixed: the seed; a one-off seed first).
+ *  The Shots stay on auto. Returns {seeds: {id: seed}, undo}. */
+function claimAutoSeeds(ids) {
+  const p = P(), before = p.settings.seed, seeds = {}, pend = [];
+  for (const id of ids) {
+    const s = p.shots.find((x) => x.id === id);
+    if (!s || s.bypassed || s.kind === "clip" || !isAuto(s)) continue;
+    if (hasSeed(s.seed_pending)) { seeds[id] = Number(s.seed_pending); pend.push([s, s.seed_pending]); s.seed_pending = null; }
+    else seeds[id] = seedIncrements(p) ? takeCounterSeed(null) : (Number(p.settings.seed) || 0);
+  }
+  return { seeds, undo: () => { p.settings.seed = before; for (const [x, v] of pend) x.seed_pending = v; } };
+}
+
+function sendable(project, claimed = {}) {
   const p = JSON.parse(JSON.stringify(project));
+  for (const s of p.shots) {
+    if (s.kind === "clip") continue;
+    if (claimed[s.id] !== undefined) s.shot_seed = claimed[s.id];                 // renders now
+    else if (isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used)) s.shot_seed = s.seed_used;   // its take
+    else if (isAuto(s) && hasSeed(s.seed_pending)) s.shot_seed = s.seed_pending;
+  }
   // Shots still on auto (not rendering in this run): what they'd get next, in order
   const base = Number(p.settings.seed) || 0;
   let k = 0;
@@ -863,7 +952,7 @@ async function askMulti(what) {
   return ans === true ? n : ans === "alt" ? 1 : 0;
 }
 
-const TAKE_FIELDS = ["take", "shot_seed", "window", "take_seconds", "rendered", "standalone", "seam", "edit_from"];
+const TAKE_FIELDS = ["take", "shot_seed", "seed_used", "context_from", "window", "take_seconds", "rendered", "standalone", "seam", "edit_from"];
 
 // ---------------------------------------------------------------------------
 // The render queue: every render is a job; jobs run one after another, from any
@@ -907,7 +996,9 @@ function jobTitle(spec, pass, of, ids) {
     return have || pass > 1 ? `take ${have + pass}` : "";
   };
   const ofTxt = of > 1 ? ` (${pass} of ${of})` : "";
-  const mode = spec.mode === "alone" ? " · on its own" : spec.kind === "reroll" ? " · reroll" : "";
+  const chipShot = spec.mode === "chip" && P() ? P().shots.find((x) => x.id === spec.target) : null;
+  const mode = spec.mode === "alone" ? " · on its own" : chipShot ? ` · ${chipName(chipShot)}`
+    : spec.kind === "reroll" ? " · reroll" : "";
   switch (spec.type) {
     case "shot": { const t = takeNo(spec.target); return `${pad(spec.target)}${mode}${t ? " · " + t : ""}${ofTxt}`; }
     case "all": return `Render all · ${ids.length} Shot${ids.length > 1 ? "s" : ""} (${numOf(ids[0])}–${numOf(ids[ids.length - 1])})${of > 1 ? ` · take ${pass} of ${of}` : ""}`;
@@ -1005,6 +1096,20 @@ function jobOpts(job) {
     if (!s || s.kind === "clip") return null;
     const n = numOf(s.id), verb = sp.kind === "reroll" ? "Re-rolling" : "Rendering";
     const seed = sp.kind === "reroll" && Number(s.shot_seed) >= 0 ? ` · seed ${s.shot_seed}` : "";
+    if (sp.mode === "chip") {
+      const plan = chipPlan(s);
+      if (plan.alone) {
+        return { upto: s.id, kind: sp.kind, standalone: true, label: `${verb} Shot ${n} · ${plan.name}${seed}${take}`,
+          note: plan.name === "Context" ? "A hard cut · the last frame of the Shot before as a reference" : "A fresh start from the references",
+          onDone: onRendered(s.id, true) };
+      }
+      const how = plan.prev && plan.next ? `from ${titleOf(plan.prev)} into ${titleOf(plan.next)}`
+        : plan.prev ? `from ${titleOf(plan.prev)}` : `into ${titleOf(plan.next)}`;
+      return { upto: s.id, kind: sp.kind, trimLeft: true, joins: plan.joins,
+        label: `${verb} Shot ${n} · ${plan.name}${seed}${take}`,
+        note: `Pinned ${how} · the Shots around it keep their takes`,
+        onDone: (args) => { onRendered(s.id)(args); chipSeams(plan, s.id); } };
+    }
     if (sp.mode === "alone") {
       return { upto: s.id, kind: sp.kind, standalone: true, label: `${verb} Shot ${n} on its own${seed}${take}`,
         note: "A fresh start from the references · no pins to the Shots around it", onDone: onRendered(s.id, true) };
@@ -1136,7 +1241,7 @@ function preparePass(job) {
     const s = P().shots.find((x) => x.id === id);
     if (!s || s.bypassed || s.kind === "clip") continue;
     rememberTake(s);
-    s.shot_seed = passSeed(job, s);
+    reseed(s, job);
     s.status = "queued";
     s.was_approved = s.was_rendered = false;
     s.edit_from = null;
@@ -1144,20 +1249,55 @@ function preparePass(job) {
   S.dry = null;
 }
 
+/** A Context Shot needs the take of the Shot before it. When both would render
+ *  in one run, this run stops at the Shot before and the rest goes into a job
+ *  right after it (which splits again at the next Context Shot). */
+function splitAtContext(job) {
+  const sp = job.spec, act = active();
+  let ids;
+  if (sp.type === "all") ids = sp.ids.filter((id) => act.some((x) => x.id === id));
+  else if (sp.type === "shot" && sp.mode === "chain") {
+    const t = act.findIndex((x) => x.id === sp.target);
+    if (t < 0) return;
+    ids = act.slice(0, t + 1).filter((x) => x.kind !== "clip" && (x.status === "queued" || x.id === sp.target)).map((x) => x.id);
+  } else return;
+  let brk = -1;
+  for (let k = 1; k < ids.length; k++) {
+    const i = act.findIndex((x) => x.id === ids[k]), pv = act[i - 1];
+    if (act[i].join === "context" && pv && ids.slice(0, k).includes(pv.id)) { brk = k; break; }
+  }
+  if (brk < 0) return;
+  const before = ids.slice(0, brk), after = ids.slice(brk);
+  let first, rest;
+  if (sp.type === "all") { first = Object.assign({}, sp, { ids: before }); rest = Object.assign({}, sp, { ids: after }); }
+  else { first = { type: "shot", target: before[before.length - 1], kind: "render", mode: "chain" }; rest = sp; }
+  job.spec = first;
+  job.ids = first.type === "all" ? first.ids.slice() : [first.target];
+  job.title = jobTitle(first, job.pass, job.of, job.ids);
+  const restIds = rest.type === "all" ? rest.ids.slice() : [rest.target];
+  const nj = { id: "j" + (++Q.seq), slug: job.slug, name: job.name, spec: rest, ids: restIds, pass: job.pass, of: job.of,
+    group: job.group, title: jobTitle(rest, job.pass, job.of, restIds), state: "waiting", added: Date.now() };
+  Q.jobs.splice(Q.jobs.indexOf(job) + 1, 0, nj);
+  saveQueue();
+}
+
 /** "Another take" queued while the Shot rendered or waited: when it starts, a
  *  Shot that has a take by then rerolls with the next seed. */
 function prepareAgain(job) {
   const s = P().shots.find((x) => x.id === job.spec.target);
   if (!s || s.bypassed || s.kind === "clip" || s.status === "queued" || !s.take) return;
-  const used = new Set([...(s.prev_seeds || []), s.shot_seed].map(Number));
+  const used = new Set([...(s.prev_seeds || []), effSeed(s)].map(Number));
   rememberTake(s);
-  let seed;
-  if (seedIncrements()) seed = takeCounterSeed(s);
+  if (isAuto(s)) reseed(s);
   else {
-    seed = Number(s.shot_seed) >= 0 ? Number(s.shot_seed) : Math.floor(Math.random() * (SEED_MAX + 1));
-    do seed = (seed + 1) % (SEED_MAX + 1); while (used.has(seed));
+    let seed;
+    if (seedIncrements()) seed = takeCounterSeed(s);
+    else {
+      seed = Number(s.shot_seed);
+      do seed = (seed + 1) % (SEED_MAX + 1); while (used.has(seed));
+    }
+    s.shot_seed = seed;
   }
-  s.shot_seed = seed;
   s.status = "queued";
   s.was_approved = s.was_rendered = false;
   s.edit_from = null;
@@ -1183,7 +1323,7 @@ function rememberPassOne(job) {
   for (const id of job.ids) {
     const s = P().shots.find((x) => x.id === id);
     if (s && s.take && s.status !== "queued") g.first[id] = JSON.parse(JSON.stringify(pickFields(s, TAKE_FIELDS)));
-    if (s && Number(s.shot_seed) >= 0) (g.base = g.base || {})[id] = Number(s.shot_seed);
+    if (s && effSeed(s) !== null) (g.base = g.base || {})[id] = effSeed(s);
   }
   g.seams = Object.assign(g.seams || {}, Object.fromEntries(P().shots.map((x) => [x.id, x.seam === undefined ? null : x.seam])));
   saveQueue();
@@ -1237,6 +1377,7 @@ function endJob(job, state, error) {
   if (state === "failed" && OOM_RE.test(error || "")) job.error = "Out of memory twice: " + error;
   saveQueue();
   renderQueue();
+  if (P() && job.slug === P().slug && !S.swapped) renderShots();    // its yellow ▶ goes back
   const g = job.group;
   if (g && Q.groups[g] && !Q.jobs.some((j) => j.group === g && liveJob(j))) finishGroup(g).then(() => queueNext());
   else setTimeout(queueNext, 0);
@@ -1259,6 +1400,7 @@ async function queueNext() {
     await inProject(job.slug, async () => {
       if (job.spec.again && !(job.pass > 1)) prepareAgain(job);
       preparePass(job);
+      splitAtContext(job);
       if (job.spec.type === "export") {
         await exportPrepare(job);
         if (!job.exportTodo.length) {
@@ -1304,7 +1446,8 @@ function pickFields(o, keys) {
 }
 
 async function queueJob({ upto, dry, kind, label, note, onDone, final = false, standalone = false, batch = null,
-  omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null, jobId = null }) {
+  omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null, jobId = null,
+  joins = null }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
@@ -1328,14 +1471,17 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   const target = upto;
   if (!standalone && !omit && (kind === "render" || kind === "reroll" || kind === "refresh")) upto = chainEnd(upto);
   // Shots on auto that this run samples take their seeds now (the counter moves up)
-  let undoSeeds = () => {};
+  let undoSeeds = () => {}, claimed = {};
   if (!dry && (kind === "render" || kind === "reroll" || kind === "final" || kind === "refresh")) {
     const act = active();
     const end = upto ? act.findIndex((x) => x.id === upto) : act.length - 1;
     const ids = standalone ? [target] : act.slice(0, end + 1).filter((x) => x.status === "queued").map((x) => x.id);
-    undoSeeds = claimAutoSeeds(ids.filter((id) => !(omit || []).includes(id)));
+    const c = claimAutoSeeds(ids.filter((id) => !(omit || []).includes(id)));
+    undoSeeds = c.undo; claimed = c.seeds;
   }
-  let project = sendable(P());          // seeds are settled on the whole timeline first
+  let project = sendable(P(), claimed);          // seeds are settled on the whole timeline first
+  // the join chip: the joins this render uses (the project keeps its own)
+  if (joins) project.shots.forEach((x) => { if (joins[x.id]) x.join = joins[x.id]; });
   // Shots left out of this render (sent bypassed; the project itself is untouched):
   // omit = given ids (the stitched preview leaves out Shots not rendered yet);
   // trimLeft = everything up to the last Shot before the target that isn't
@@ -1543,6 +1689,8 @@ function updatePreview() {
 
 /** Item 3 (round 5): every rendered Shot back to "not rendered". */
 function clearFields(s) {
+  // keeps its seed: a Shot on auto renders once more with the seed its take used
+  if (isAuto(s) && hasSeed(s.seed_used)) s.seed_pending = Number(s.seed_used);
   Object.assign(s, { status: "queued", take: null, rendered: null, edit_from: null, standalone: false,
     seam: null, was_approved: false, was_rendered: false, cleared: true });
 }
@@ -1558,7 +1706,11 @@ async function clearAll() {
   if (!ans || !ans.ok) return;
   for (const s of list) clearFields(s);
   if (ans.checked) {
-    for (const s of active()) if (s.kind !== "clip") { rememberTake(s); s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1)); }
+    for (const s of active()) if (s.kind !== "clip") {
+      rememberTake(s);
+      if (isAuto(s)) s.seed_pending = seedIncrements() ? null : Math.floor(Math.random() * (SEED_MAX + 1));
+      else s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
+    }
   }
   S.gen++;
   S.dry = null;
@@ -1608,7 +1760,13 @@ function adoptRows(rows, sent, standalone = false) {
     sh.take = r.take;
     sh.window = r.window_frames;
     sh.take_seconds = Number(sh.seconds);
-    if (!(Number(sh.shot_seed) >= 0) && r.seed !== null && r.seed !== undefined) sh.shot_seed = r.seed;
+    // a Shot on auto stays on auto; the seed its take used is kept beside it
+    sh.seed_used = r.seed !== null && r.seed !== undefined ? Number(r.seed) : effSeed(sh);
+    if (r.status !== "locked") {
+      sh.seed_pending = null;
+      const act = active(), pv = act[act.indexOf(sh) - 1];
+      sh.context_from = sh.join === "context" && pv ? (pv.kind === "clip" ? `clip:${pv.id}` : pv.take || null) : null;
+    }
     const was = (sent || {})[sh.id] || { text: sh.text, seconds: Number(sh.seconds) };
     sh.rendered = { text: was.text, seconds: was.seconds, seed: Number(sh.shot_seed) };
     sh.edit_from = null;
@@ -1728,7 +1886,7 @@ async function reroll() {
   const takes = await askMulti(titleOf(rv));
   if (!takes || reviewShot() !== rv || inRenderGuard(rv)) return;
   rememberTake(rv);
-  rv.shot_seed = freshSeed(rv);
+  reseed(rv);
   rv.status = "queued";
   enqueue({ type: "shot", target: rv.id, kind: "reroll", mode: alone ? "alone" : "pinned" }, takes);
 }
@@ -1766,36 +1924,39 @@ async function renderOdd() {
   enqueue(list.map((x) => ({ type: "shot", target: x.id, kind: "render", mode: "alone" })), takes);
 }
 
-/** ▶ on a Shot card: render it on its own (Multi-take asks first). */
+/** ▶ on a Shot card: render it the way its join chip says (Multi-take asks first). */
 async function renderAloneAction(s) {
   if (!s || s.kind === "clip" || s.bypassed) return;
   if (inRender(s) || jobFor(s.id)) {
     // rendering now or already queued: one more take after it, with the next seed
     const takes = await askMulti(`Another take of ${titleOf(s)}`);
     if (!takes) return;
-    enqueue({ type: "shot", target: s.id, kind: "reroll", mode: s.standalone ? "alone" : "pinned", again: true }, takes);
+    enqueue({ type: "shot", target: s.id, kind: "reroll", mode: "chip", again: true }, takes);
     return;
   }
   const takes = await askMulti(titleOf(s));
   if (!takes) return;
-  enqueue({ type: "shot", target: s.id, kind: "render", mode: "alone" }, takes);
+  enqueue({ type: "shot", target: s.id, kind: "render", mode: "chip" }, takes);
 }
 
 /** Item 4 (round 5): a standalone Shot re-rendering next to rendered Shots —
  *  pinned to them in place (default), or on its own again.
  *  "pinned" | "alone" | null (cancelled). No rendered neighbour: "alone". */
 async function askStandalone(s, verb) {
+  // a Shot that starts with a Context or Cut join has nothing to flow from: in place, no question
+  if (isCut(s)) return "pinned";
   const act = active(), i = act.indexOf(s);
   const prev = act[i - 1] && isRendered(act[i - 1]) ? act[i - 1] : null;
-  const next = act[i + 1] && isRendered(act[i + 1]) ? act[i + 1] : null;
+  const nx = act[i + 1];
+  const next = nx && isRendered(nx) && !isCut(nx) ? nx : null;
   if (!prev && !next) return "alone";
+  const both = prev && next;
   const names = [prev, next].filter(Boolean).map(titleOf).join(" and ");
-  const how = [prev ? `starts from the end of ${titleOf(prev)}` : "", next ? `leads into ${titleOf(next)}` : ""]
+  const how = [prev ? `continues from the end of ${titleOf(prev)}` : "", next ? `flows into ${titleOf(next)}` : ""]
     .filter(Boolean).join(" and ");
   const ans = await confirmBox({ title: `${verb} ${titleOf(s)}`,
-    body: `Pinned: ${titleOf(s)} ${how}, in place. ${names} keep${prev && next ? "" : "s"} ${prev && next ? "their takes" : "its take"}, ` +
-      `and ${titleOf(s)} is no longer standalone. On its own: a fresh start from the references; ` +
-      `the join${prev && next ? "s" : ""} with ${names} become${prev && next ? " hard cuts" : "s a hard cut"} until bridged again.`,
+    body: `Pinned: ${titleOf(s)} ${how}, in place. ${names} keep${both ? "" : "s"} ${both ? "their takes" : "its take"}.\n\n` +
+      `On its own: ${titleOf(s)} starts fresh from the references, with a hard cut to ${names} until you bridge ${both ? "them" : "it"} again.`,
     yes: `Pinned to ${names}`, alt: "On its own", no: "Cancel" });
   return ans === true ? "pinned" : ans === "alt" ? "alone" : null;
 }
@@ -2042,7 +2203,7 @@ function makeMissingClips(list) {
 
 function seedOfTake(s) {
   const m = /__(\d+)__/.exec(s.take || "");
-  return m ? m[1] : Number(s.shot_seed) >= 0 ? String(s.shot_seed) : "auto";
+  return m ? m[1] : effSeed(s) !== null ? String(effSeed(s)) : "auto";
 }
 
 function approvedForExport() {
@@ -2161,7 +2322,7 @@ function buildTL() {
     // takes each gives up half of the shared frames, so the length matches the film.
     for (let i = 1; i < entries.length; i++) {
       const a = entries[i - 1], b = entries[i];
-      if (a.kind !== "take" || b.kind !== "take" || b.join === "cut") continue;
+      if (a.kind !== "take" || b.kind !== "take" || isCut(b)) continue;
       const h = Math.min(half, a.dur / 3, b.dur / 3);
       a.dur -= h;
       b.off += h;
@@ -2620,7 +2781,21 @@ function renderStyle() {
   if (!S.styleOpen) return;
   const st = P().style;
   $("style").innerHTML = STYLE_FIELDS.map(([k, label, rows]) =>
-    `<label for="f-${k}">${label}</label><textarea id="f-${k}" data-style="${k}" rows="${rows}">${esc(st[k])}</textarea>`).join("");
+    `<label for="f-${k}">${label}</label><textarea class="fit" id="f-${k}" data-style="${k}" rows="${rows}">${esc(st[k])}</textarea>`).join("");
+  fitAll($("style"));
+}
+
+/** Style & Sound and Shot prompt boxes: as tall as their text (the rows attribute
+ *  is the least), on open, while typing and after every redraw. */
+function fitText(el) {
+  if (!el || !el.isConnected || !el.offsetParent) return;
+  el.style.height = "auto";
+  const cs = getComputedStyle(el);
+  const border = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth);
+  el.style.height = el.scrollHeight + border + "px";
+}
+function fitAll(root) {
+  for (const el of (root || document).querySelectorAll("textarea.fit")) fitText(el);
 }
 
 const LOOK = {
@@ -2650,13 +2825,28 @@ const inRenderAny = () => busyHere() && !!S.busy && !!S.busy.built && S.busy.kin
 const inRender = (s) => busyHere() && !!S.busy && S.busy.kind !== "dry" && S.busy.kind !== "check" &&
   !!S.busy.built && S.busy.built.chain.includes(s.id);
 
+const CHIP_HELP = {
+  cut: "a fresh start from the references; nothing pinned.",
+  context: "a hard cut; the last frame of the Shot before goes in as a reference picture (same characters, place and light).",
+  from: "continues from the end of the Shot before; its end is free.",
+  into: "a fresh start that flows into the start of the Shot after.",
+  bridge: "pinned at both ends: flows from the Shot before into the Shot after.",
+};
+function chipKey(s) {
+  const j = chipJoin(s);
+  if (j !== "bridge") return j;
+  const { prev, next } = chipSides(s);
+  return prev && next ? "bridge" : prev ? "from" : "into";
+}
+
 /** The always-visible row of a (generated) Shot card: status, title, preview, tools. */
 function shotRowHTML(s) {
   const rid = renderingId();
   const state = s.bypassed ? "bypassed" : s.id === rid ? "rendering" : s.status;
   const L = LOOK[state];
   const title = s.bypassed ? "Bypassed" : "Shot " + numOf(s.id);
-  const seed = s.shot_seed < 0 || s.shot_seed === "" ? "auto" : String(s.shot_seed);
+  const seed = !isAuto(s) ? String(s.shot_seed)
+    : s.status !== "queued" && hasSeed(s.seed_used) ? `auto · ${s.seed_used}` : "auto";
   const open = S.open === s.id;
   const chipBorder = state === "queued" ? "#33363C" : "transparent";
   const edited = s.status === "queued" && s.edit_from && !s.bypassed;
@@ -2667,11 +2857,10 @@ function shotRowHTML(s) {
   const row = lastRowFor(s.id);
   const cut = cutBefore(s)
     ? (s.standalone
-      ? '<span class="flag cut" title="Rendered on its own, so it doesn\'t follow on from the Shot before it. Render or reroll the Shot before it to bridge into it, or Bridge here to continue this Shot from it.">↯ hard cut · standalone</span>'
+      ? '<span class="flag cut" title="Rendered on its own, so it doesn\'t follow on from the Shot before it. Render the Shot before it with its chip on Continuous or Bridge to join them.">↯ hard cut · standalone</span>'
       : '<span class="flag cut" title="This Shot doesn\'t follow on from the take of the Shot before it, so the join is a hard cut.">↯ hard cut</span>') : "";
   const standaloneTag = !cut && s.standalone && s.status !== "queued" && !s.bypassed
     ? '<span class="flag standalone" title="Rendered on its own, from the references. The Shot before it bridges into it.">standalone</span>' : "";
-  const bridge = cut ? `<button class="ghost sm bridge" data-action="bridge" title="Re-render ${title} in place so it flows from the Shot before it${s.standalone ? " (it stops being standalone)" : ""}; the Shots after it stay">Bridge</button>` : "";
   // rendering now or waiting in the queue: ▶ (yellow) queues another take after it
   const live = !s.bypassed && s.kind !== "clip" && (s.id === rid || inRender(s) || !!jobFor(s.id));
   const canAlone = (state === "queued" || live) && s.kind !== "clip" && !s.bypassed;
@@ -2680,17 +2869,28 @@ function shotRowHTML(s) {
     ? `<button class="sdot sdot-play again" data-action="render-alone"${aloneOff ? " disabled" : ""}
       title="${s.id === rid ? "Rendering now" : "In the queue"}. Click to queue another take of ${title} after it (next seed)." aria-label="Queue another take of ${title}">▶</button>`
     : `<button class="sdot sdot-play" data-action="render-alone"${aloneOff ? " disabled" : ""}
-      title="Render this Shot on its own — a fresh start, not continued from the Shot before." aria-label="Render ${title} on its own">▶</button>`;
+      title="Render ${title} · ${chipName(s)}: ${esc(CHIP_HELP[chipKey(s)])}" aria-label="Render ${title} (${chipName(s)})">▶</button>`;
+  // the join chip: how ▶ renders it, from the approved Shots next to it
+  const actR = active(), prevR = !s.bypassed ? actR[actR.indexOf(s) - 1] : null;
+  const cj = chipJoin(s), opts = chipOptions(s);
+  const icon = { bridge: "↔", context: "⧉", cut: "|" }[cj];
+  const joinChip = !s.bypassed && s.kind !== "clip"
+    ? `<button class="join-chip j-${esc(cj)}${opts.length < 2 ? " only" : ""}" data-action="cycle-join" title="${esc(chipName(s) + ": " + CHIP_HELP[chipKey(s)])}${
+      opts.length < 2 ? " No approved Shot next to it, so Cut is the only choice." : ` Click to switch: ${opts.map((o) => chipName(s, o)).join(" → ")}.`}">${icon} ${chipName(s)}</button>` : "";
+  const ctxStale = s.join === "context" && s.status !== "queued" && s.context_from && prevR &&
+    (prevR.kind === "clip" ? `clip:${prevR.id}` : prevR.take) !== s.context_from;
+  const ctxFlag = ctxStale ? `<span class="flag cut" title="The Shot before has a different take now. Re-render ${title} to take its new last frame.">context changed</span>` : "";
+  const ctxBtn = ctxStale ? `<button class="ghost sm bridge" data-action="context-redo" title="Re-render ${title} from the new last frame of the Shot before (the Shots after it keep their takes)">Re-render</button>` : "";
   return `${play}<button class="shot-head${play ? " has-play" : ""}" data-action="toggle-shot" aria-expanded="${open}">
           ${play ? "" : `<span class="sdot" style="background:${L.dot};color:${L.fg}">${L.icon}</span>`}
           <span class="stitle">${title}</span>
           <span class="smeta">${esc(s.seconds)}s · seed ${esc(seed)}</span>
           <span class="sprev">${esc(s.text) || '<i class="muted">empty</i>'}</span>
-          ${flag}${cut}${standaloneTag}
+          ${flag}${cut}${standaloneTag}${ctxFlag}
           <span class="chip" style="background:${L.chipBg};color:${L.chipFg};border-color:${chipBorder}">${L.label}</span>
         </button>
         <div class="shot-tools">
-          ${bridge}
+          ${joinChip}${ctxBtn}
           ${canReroll ? `<button class="icon lg reroll" data-action="reroll-shot" title="Reroll ${title} (new seed)" aria-label="Reroll ${title}">⟳</button>` : ""}
           <button class="icon lg${s.bypassed ? " on" : ""}" data-action="bypass-shot" aria-pressed="${s.bypassed}" title="${s.bypassed ? "Turn shot back on" : "Bypass shot"}">${POWER}</button>
           <button class="icon lg x" data-action="remove-shot" title="Remove" aria-label="Remove ${title}">${CROSS}</button>
@@ -2838,10 +3038,10 @@ function renderShots() {
     const takes = !s.bypassed && s.status !== "queued" ? takeNav(s) : "";
     const ro = inRender(s) ? ' readonly title="Part of the render in progress; edit it when it finishes"' : "";
     const body = open ? `<div class="shot-body">
-        <textarea class="field" data-shot-field="text" rows="6" aria-label="${title} text"${ro}>${esc(s.text)}</textarea>
+        <textarea class="field fit" data-shot-field="text" rows="3" aria-label="${title} text"${ro}>${esc(s.text)}</textarea>
         <div class="shot-opts">
           <label class="lbl-row">Seconds <input type="number" step="0.1" min="0.1" data-shot-field="seconds" value="${esc(s.seconds)}" style="width:72px"${ro}></label>
-          <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto" style="width:120px"${ro}></label>
+          <label class="lbl-row">Seed <input class="mono" data-shot-field="shot_seed" value="${s.shot_seed < 0 ? "" : esc(s.shot_seed)}" placeholder="auto${isAuto(s) && s.status !== "queued" && hasSeed(s.seed_used) ? ` · ${s.seed_used}` : ""}" style="width:120px"${ro}></label>
           <button class="ghost sm" data-action="wrap" data-before="&lt;d&gt;[English] " data-after="&lt;/d&gt;">Wrap &lt;d&gt; dialogue</button>
           <button class="ghost sm" data-action="wrap" data-before="&quot;" data-after="&quot;">Wrap "on-screen text"</button>
           ${canReroll ? '<button class="ghost sm" data-action="reroll-shot">⟳ Reroll this Shot</button>' : ""}
@@ -2872,6 +3072,7 @@ function renderShots() {
   first.hidden = !P().shots.length;
   first.innerHTML = `${PLUS} Add shot before Shot 1`;
   $("add-first-clip").hidden = !P().shots.length;
+  fitAll($("shots"));
 }
 
 function clipCard(s) {
@@ -2970,7 +3171,13 @@ function renderViewer() {
   $("loop").setAttribute("aria-pressed", S.loop && !!L);
   $("loop").disabled = !has || !L;
   const hasFile = !!(lo && lo.video);
-  for (const el of document.querySelectorAll('[data-which="output"], #download')) el.toggleAttribute("disabled", !hasFile);
+  // Open output folder always works (local only): the latest video, else the clips folder
+  for (const el of document.querySelectorAll('[data-which="output"]')) {
+    el.removeAttribute("disabled");
+    el.title = hasFile ? "Open the output folder with the latest video selected"
+      : "Open this project's clips folder with the Shot in focus selected";
+  }
+  $("download").toggleAttribute("disabled", !hasFile);
   $("download").hidden = S.local || !hasFile;
   updateTime();
 }
@@ -3230,6 +3437,7 @@ function renderSettings() {
   const s = P().settings, o = S.opts || {};
   const vsr = s.rtx_vsr;
   const vsrOk = !S.opts || !S.opts.nodes || S.opts.nodes.RTXVideoSuperResolution !== false;
+  const vsrFold = folded("vsr");
   const size = sizeOf(s);
   const t = s.turbo;
   $("settings-summary").textContent = S.settingsOpen ? "" : [`seed ${s.seed}`,
@@ -3248,7 +3456,7 @@ function renderSettings() {
   const asp = (o.aspects || ["16:9"]).map((a) => `<option${a === s.aspect ? " selected" : ""}>${a}</option>`).join("");
   $("settings").innerHTML = `
     <div class="seed-row">
-      <label class="lbl">Seed <input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help"></label>
+      <label class="lbl">Seed <input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help" title="Drag left / right to change it (Shift: by 10), or click and type"></label>
       <label class="lbl seed-mode" title="Increment: the seed goes up by one for every Shot rendered, like ComfyUI's control after generate. Fixed: it stays.">Seed mode
         <select data-set="seed_mode" aria-label="Seed mode"><option value="increment"${s.seed_mode !== "same" ? " selected" : ""}>Increment</option><option value="same"${s.seed_mode === "same" ? " selected" : ""}>Fixed</option></select></label>
       <button class="ghost sm reset-seeds" data-action="reset-seeds"${P().shots.some((x) => x.kind !== "clip" && Number(x.shot_seed) >= 0) ? "" : " disabled"}
@@ -3265,9 +3473,11 @@ function renderSettings() {
     </div>${warn}
     <div class="size-out">${size ? `→ ${size[0]} × ${size[1]} output` : "→ size unknown"}${size && vsr.on && vsrOk
       ? ` · <span class="vsr-size">${even(size[0] * vsr.scale)} × ${even(size[1] * vsr.scale)} after RTX Super Resolution</span>` : ""}</div>
-    <div class="vsr-row${vsr.on && vsrOk ? "" : " off"}">
+    <div class="vsr-row vsr-zone${vsr.on && vsrOk ? "" : " off"}${vsrFold ? " folded" : ""}">
       ${switchHTML(vsr.on && vsrOk, `data-action="vsr-on" aria-label="RTX Super Resolution"${vsrOk ? "" : " disabled"}`, true)}
-      <div class="vsr-text"><div>Upscale previews <span class="muted small">· RTX Super Resolution</span></div>
+      <button class="fold vsr-fold" data-action="fold" data-fold="vsr" aria-expanded="${!vsrFold}"
+        title="${vsrFold ? "Show the upscale settings" : "Show only the switch"}"><span class="fold-ch" aria-hidden="true">▾</span>RTX Super Resolution${vsrFold && vsr.on && vsrOk ? ` <span class="muted small">· ${vsr.scale}× ${esc(vsr.quality)}</span>` : ""}</button>
+      <div class="vsr-text"><div>Upscale previews</div>
         <div class="muted small">${!vsrOk ? "Install ComfyUI-NVIDIA-RTX-VSR-Pro (RTX GPU) to use it."
           : vsr.on ? "Every render is upscaled (slower as the chain grows). Never re-renders Shots."
             : "Off: previews stay fast. Upscale final video (when every Shot is approved) always upscales with this scale and quality."}</div>
@@ -3406,10 +3616,12 @@ function renderPlan() {
     if (s.status !== "queued" && !row && !dry && s.take) {
       // not in the last render (it showed one standalone Shot): its take is still there
       len = s.seconds + "s";
-      status = `take · seed ${s.shot_seed}`;
+      status = `take · seed ${effSeed(s)}`;
       color = s.status === "approved" ? "#9FE0C2" : "#FFD08A";
     }
     if (s.standalone && s.status !== "queued") status += " · standalone";
+    if (s.join === "context") status = status.replace(/ · cut\b/g, "") + " · context";
+    else if (s.join === "cut" && !/ · cut\b/.test(status)) status += " · cut";
     if (cutBefore(s) && !/hard cut/.test(status)) status += " · cut before it";
     if (((dry || row) && (dry || row).seam === "mismatch") || cutBefore(s)) color = "#FFB4A8";
     return `<div class="plan-row${s.id === peekId ? " peek" : ""}"><span>Seg ${k + 1}</span><span class="muted">${esc(len)}</span><span style="color:${color}">${esc(status)}</span></div>`;
@@ -3491,6 +3703,8 @@ document.addEventListener("click", async (e) => {
     case "replace-clip": pickClip(shotOf(el).id, true); break;
     case "pick-clip-file": pickClipFile(shotOf(el)); break;
     case "toggle-join": toggleJoin(shotOf(el)); break;
+    case "cycle-join": cycleJoin(shotOf(el)); break;
+    case "context-redo": redoInPlace(shotOf(el)); break;
     case "insert-before": case "insert-after": {
       const s = shotOf(el);
       insertShot(p.shots.indexOf(s) + (a === "insert-after" ? 1 : 0));
@@ -3713,8 +3927,8 @@ document.addEventListener("input", (e) => {
     return;
   }
   if (el.id === "editor-desc") autoGrow(el);
-  else if (el.dataset.style) { p.style[el.dataset.style] = el.value; scheduleSave(); }
-  else if (el.dataset.shotField) shotInput(el);
+  else if (el.dataset.style) { p.style[el.dataset.style] = el.value; fitText(el); scheduleSave(); }
+  else if (el.dataset.shotField) { shotInput(el); if (el.tagName === "TEXTAREA") fitText(el); }
   else if (el.type === "range" && el.nextElementSibling && el.nextElementSibling.tagName === "OUTPUT") {
     el.nextElementSibling.textContent = Number(el.value).toFixed(2);
   }
@@ -4487,10 +4701,17 @@ async function clearSegments() {
 
 async function openFolder(which) {
   const lo = last();
+  let select = null, subfolder = null;
+  if (which === "output" && lo && lo.video) { select = lo.video.filename; subfolder = lo.video.subfolder; }
+  else if (which === "output") {
+    // no stitched video (renders save per-take clips): the clips folder, the focused Shot's clip selected
+    subfolder = `longshot/${P().slug}/clips`;
+    const s = shotById(S.focus) || reviewShot();
+    const key = s && s.kind !== "clip" && s.take ? takeStem(s.take) : null;
+    if (key && S.clips[key]) select = key + ".mp4";
+  }
   try {
-    await api("/longshot/open-folder", { method: "POST",
-      body: { which, project: P().slug, select: which === "output" && lo && lo.video ? lo.video.filename : null,
-        subfolder: which === "output" && lo && lo.video ? lo.video.subfolder : null } });
+    await api("/longshot/open-folder", { method: "POST", body: { which, project: P().slug, select, subfolder } });
   } catch (e) { toast(e.message); }
 }
 
@@ -4586,6 +4807,33 @@ async function confirmShared(what, shots) {
 // C.1 Base seed
 // ---------------------------------------------------------------------------
 
+/** Drag the Seed field left / right to step the seed down / up (one per 4 px,
+ *  ten with Shift held). A click without dragging types in it as usual. */
+document.addEventListener("pointerdown", (e) => {
+  const el = e.target.closest && e.target.closest("[data-base-seed]");
+  if (!el || e.button !== 0) return;
+  const x0 = e.clientX, v0 = Number(el.value) || 0;
+  let dragging = false;
+  const move = (ev) => {
+    const dx = ev.clientX - x0;
+    if (!dragging && Math.abs(dx) < 4) return;
+    if (!dragging) { dragging = true; el.blur(); document.body.classList.add("seed-dragging"); }
+    ev.preventDefault();
+    const step = ev.shiftKey ? 10 : 1;
+    el.value = String(Math.max(0, Math.min(SEED_MAX, v0 + Math.round(dx / 4) * step)));
+  };
+  const up = () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+    window.removeEventListener("pointercancel", up);
+    document.body.classList.remove("seed-dragging");
+    if (dragging) changeBaseSeed(el).then(() => renderSettings());
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+  window.addEventListener("pointercancel", up);
+});
+
 async function changeBaseSeed(el) {
   const s = P().settings;
   const v = el.value.trim();
@@ -4666,6 +4914,9 @@ $("editor").addEventListener("click", async (e) => {
     yes: "Discard", no: "Keep editing" }))) return;
   closeEditor();
 });
+
+let fitTimer = null;
+window.addEventListener("resize", () => { clearTimeout(fitTimer); fitTimer = setTimeout(() => fitAll(), 60); });
 
 function autoGrow(el) {
   el.style.height = "auto";
@@ -4889,15 +5140,15 @@ async function resetShotSeeds() {
   const shots = P().shots.filter((s) => s.kind !== "clip");
   if (!shots.some((s) => Number(s.shot_seed) >= 0)) { toast("Every Shot is already on auto."); return; }
   const act = active().filter((s) => s.kind !== "clip");
-  const approved = act.filter((s) => s.status === "approved");
+  const approved = act.filter((s) => s.status === "approved" && !isAuto(s));
   // approved Shots keep their seeds and takes (the notice offers all Shots);
   // Shots in the render going now keep theirs
   const keep = (s) => (all ? false : s.status === "approved" && !s.bypassed) || inRender(s);
   let all = false;
-  const which = shots.filter((s) => !keep(s));
+  const which = shots.filter((s) => !isAuto(s) && !keep(s));
   if (approved.length) {
     changeNote("Shot seeds", `${approved.length} approved Shot${approved.length > 1 ? "s keep their seeds and takes" : " keeps its seed and take"}`,
-      { label: "Reset approved Shots too", fn: () => { all = true; resetSeeds(shots.filter((s) => !keep(s))); } });
+      { label: "Reset approved Shots too", fn: () => { all = true; resetSeeds(shots.filter((s) => !isAuto(s) && !keep(s))); } });
   }
   resetSeeds(which);
 }
@@ -4907,6 +5158,7 @@ function resetSeeds(which) {
   S.dry = null;
   let again = 0;
   for (const s of which) {
+    if (s.take) s.seed_used = effSeed(s);
     s.shot_seed = -1;
     s.edit_from = null;
     delete S.bad[s.id + ":shot_seed"];
@@ -5109,8 +5361,8 @@ function bridgeAround(s) {
   const out = [];
   const prev = act[i - 1], next = act[i + 1];
   S.gen++;
-  if (prev && prev.kind !== "clip" && s.join !== "cut" && prev.status !== "queued") { prev.status = "queued"; out.push(prev); }
-  if (next && next.kind !== "clip" && next.join !== "cut" && next.status !== "queued") { next.status = "queued"; out.push(next); }
+  if (prev && prev.kind !== "clip" && !isCut(s) && prev.status !== "queued") { prev.status = "queued"; out.push(prev); }
+  if (next && next.kind !== "clip" && !isCut(next) && next.status !== "queued") { next.status = "queued"; out.push(next); }
   S.dry = null;
   return out;
 }
@@ -5221,6 +5473,39 @@ function clipChanged(s) {
   if (redo.length) toast(`${titleOf(s)}'s clip changed.` + bridgeNote(redo));
 }
 
+/** Continuous → Context → Cut, between two generated Shots. A rendered Shot
+ *  keeps its take; the notice offers to render it again the new way. */
+function cycleJoin(s) {
+  if (!s || listGuard(P().shots.indexOf(s))) return;
+  const order = chipOptions(s);
+  if (order.length < 2) {
+    toast(`${titleOf(s)} has no approved Shot next to it, so it renders on its own (Cut). ` +
+      "Approve the Shot before or after it for Continuous, Context or Bridge.");
+    return;
+  }
+  const wasJ = chipJoin(s), was = chipName(s, wasJ);
+  s.join = order[(order.indexOf(wasJ) + 1) % order.length];
+  const name = { [s.join]: chipName(s, s.join) };
+  P().preview_dirty = true;
+  S.dry = null;
+  if (s.status !== "queued" && s.take) {
+    changeNote(`${titleOf(s)}'s join`, `now ${name[s.join]}; its take was made ${was}`,
+      { label: `Re-render ${titleOf(s)}`, fn: () => redoInPlace(s) });
+  }
+  commit();
+}
+
+/** Render a Shot again in its place (the Shots around it keep their takes). */
+function redoInPlace(s) {
+  if (!s || s.kind === "clip" || inRenderGuard(s)) return;
+  if (jobFor(s.id)) { toast(`${titleOf(s)} is already in the queue.`); return; }
+  rememberTake(s);
+  if (s.status === "approved") s.was_approved = true; else if (s.status === "review") s.was_rendered = true;
+  s.status = "queued";
+  S.dry = null;
+  enqueue({ type: "shot", target: s.id, kind: "render", mode: "chip" });
+}
+
 function toggleJoin(s) {
   if (!s || listGuard(P().shots.indexOf(s))) return;
   const act = active();
@@ -5325,7 +5610,13 @@ function stepTake(s, dir) {
   if (!list) return;
   const i = list.findIndex((t) => t.name === s.take);
   const t = list[i + dir];
-  if (t) useTake(s, t.name);
+  if (!t) return;
+  useTake(s, t.name);
+  if (s.take !== t.name) return;                 // not switched (locked)
+  // review it: the scrubber goes to the start of this Shot's piece
+  buildTL();
+  const e = TL.entries.find((x) => x.id === s.id);
+  if (e) { if (PL.playing) pausePlayer(); tlSeek(e.start + 0.04); }
 }
 
 /** Switching takes is instant: the take is a file, so nothing samples. */
@@ -5334,7 +5625,7 @@ function useTake(s, name) {
   const t = (S.takes[s.id] || []).find((x) => x.name === name);
   if (!t) return;
   s.take = t.name;
-  if (t.seed !== null && t.seed !== undefined) s.shot_seed = t.seed;
+  if (t.seed !== null && t.seed !== undefined) { if (isAuto(s)) s.seed_used = Number(t.seed); else s.shot_seed = t.seed; }
   s.window = t.window_frames;
   s.take_seconds = Number(s.seconds);
   s.rendered = { text: s.text, seconds: Number(s.seconds), seed: Number(s.shot_seed) };
@@ -5380,7 +5671,7 @@ async function deleteTake(id, name) {
 
 function rememberTake(s) {
   const row = lastRowFor(s.id);
-  const seed = Number(s.shot_seed) >= 0 ? Number(s.shot_seed) : row ? row.seed : null;
+  const seed = effSeed(s) ?? (row ? row.seed : null);
   if (seed === null || seed === undefined) return;
   s.prev_seeds = (s.prev_seeds || []).filter((x) => x !== seed).concat([seed]).slice(-10);
 }
@@ -5408,7 +5699,7 @@ function bridgeShot(s) {
   if (!s || inRenderGuard(s)) return;
   if (jobFor(s.id)) { toast(`${titleOf(s)} is already in the queue.`); return; }
   rememberTake(s);
-  s.shot_seed = freshSeed(s);
+  reseed(s);
   s.status = "queued";
   s.was_approved = false;
   S.dry = null;
@@ -5440,7 +5731,7 @@ async function rerollShot(s) {
     }
   }
   rememberTake(s);
-  s.shot_seed = freshSeed(s);
+  reseed(s);
   s.status = "queued";
   s.was_approved = false;
   S.dry = null;

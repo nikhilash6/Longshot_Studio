@@ -628,7 +628,10 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         frames = shot.get("frames") or 0
         frames = int(frames) if isinstance(frames, (int, float)) and frames > 0 and \
             int(frames) % 17 == 5 else 0
-        join = shot.get("join") if shot.get("join") in ("bridge", "cut") else "bridge"
+        # Context Continuity: a cut for Long Shot (nothing pinned), with the last
+        # frame of the Shot before as one more reference picture
+        join = "cut" if shot.get("join") == "context" else \
+            shot.get("join") if shot.get("join") in ("bridge", "cut") else "bridge"
         text = shot.get("text", "")
         anchor_inputs = {}
         if not lock:
@@ -652,6 +655,17 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                     lead = f"The shot begins from <Picture {pic}>. "
                 else:
                     tail = f" The shot ends on <Picture {pic}>."
+            ctx = shot.get("context_image") if shot.get("join") == "context" else None
+            if isinstance(ctx, dict) and ctx.get("file"):
+                pic += 1
+                try:
+                    image = pj.input_path_value(ctx["file"], ctx.get("subfolder", ""))
+                except ValueError as err:
+                    raise BuildError(f"Shot {n}'s context frame: {err}") from None
+                anchor_inputs["context_image"] = g.add(f"context{n}", "LoadImage",
+                                                       f"Shot {n} context (last frame before)", image=image)
+                lead = (f"Use <Picture {pic}> (the last frame of the shot before) as the reference for "
+                        "continuity: same characters, place, lighting and wardrobe. ") + lead
             text = (lead + text + tail).strip()
         inputs = dict(shot_id=str(shot.get("id") or f"shot{n}"), seconds=seconds,
                       text=text,
