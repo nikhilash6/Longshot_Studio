@@ -105,7 +105,13 @@ function normalize(p) {
   p.cast = (p.cast || []).map((c) => ({ id: c.id || uid("c"), label: c.label || "", desc: c.desc || "",
     role: c.role || "appearance", image: c.image || "", subfolder: c.subfolder || "", type: "input",
     size_bytes: c.size_bytes ?? null, sha256: c.sha256 || null,
-    original_name: c.original_name || c.image || "", bypassed: !!c.bypassed }));
+    original_name: c.original_name || c.image || "", bypassed: !!c.bypassed,
+    voice: c.voice || null }));          // voice reference id: "gets its voice timbre from"
+  // voice references: audio cards in Cast & Scenes, <Audio N> after the song's vocals
+  p.voices = (p.voices || []).map((v) => ({ id: v.id || uid("v"), label: v.label || "", file: v.file || "",
+    subfolder: v.subfolder || "", type: "input", original_name: v.original_name || v.file || "",
+    sha256: v.sha256 || null, size_bytes: v.size_bytes ?? null, start: Math.max(0, Number(v.start) || 0),
+    length: Math.max(0, Number(v.length) || 0), bypassed: !!v.bypassed }));
   p.style = Object.assign({ summary: "", retention: "", style_line: "", soundscape: "", music: "N/A",
     task_types: ["reference generation"] }, p.style || {});
   p.shots = (p.shots || []).map((s) => ({ id: s.id || uid("s"), text: s.text || "",
@@ -151,6 +157,16 @@ function normalize(p) {
 
 const active = () => P().shots.filter((s) => !s.bypassed);
 const liveCast = () => P().cast.filter((c) => !c.bypassed);
+/** Voice references that are on (and have a file): <Audio N> in card order, after
+ *  the song's vocals when Audio → Voice reference is on. Long Shot takes 3 in all. */
+const MAX_AUDIO_REFS = 3;
+const liveVoices = () => (P().voices || []).filter((v) => !v.bypassed && v.file);
+const voiceById = (id) => (P().voices || []).find((v) => v.id === id) || null;
+function audioLabelOf(v) {
+  const i = v ? liveVoices().indexOf(v) : -1;
+  return i < 0 ? null : `<Audio ${(P().audio.voice_ref ? 1 : 0) + i + 1}>`;
+}
+const audioRefCount = () => liveVoices().length + (P().audio.voice_ref ? 1 : 0);
 const numOf = (id) => active().findIndex((s) => s.id === id) + 1;
 const titleOf = (s) => (s ? "Shot " + numOf(s.id) : "—");
 const reviewShot = () => {
@@ -176,22 +192,26 @@ function nextToRender() {
  *  last frame of the Shot before as a reference picture). */
 const isCut = (s) => !!s && (s.join === "cut" || s.join === "context");
 
-/** The join chip (0.8.2): how ▶ renders a Shot, offered by the approved Shots
- *  right next to it (clips count as approved).
- *    none            → Cut (standalone)
- *    before only     → Cut, Context, Continuous (from the Shot before)
- *    after only      → Cut, Continuous (into the Shot after)
- *    before + after  → Cut, Context, Bridge (pinned at both ends)
- *  The choice is kept in s.join ("cut" | "context" | "bridge"); a choice not on
- *  offer shows (and renders) as Cut. Render all and the main button still read
- *  s.join as the join with the Shot before, as they always have. */
+/** The join chip: what the user wants at this Shot's joins. Its choices come
+ *  from the Shots that exist next to it (0.8.3):
+ *    none            → Cut
+ *    a Shot before   → Cut, Context, Continuous
+ *    a Shot after    → Cut, Continuous
+ *  Continuous reads "Bridge" when the Shots on both sides are approved. Kept in
+ *  s.join ("cut" | "context" | "bridge"; Continuous is the default). Render all
+ *  and the main button read it as the join with the Shot before; ▶ on one Shot
+ *  applies it to the approved Shots next to it at that moment (chipPlan). */
+function chipNear(s) {
+  const act = active(), i = act.indexOf(s);
+  return { prev: i > 0 ? act[i - 1] : null, next: i >= 0 ? act[i + 1] || null : null };
+}
 function chipSides(s) {
   const act = active(), i = act.indexOf(s);
   const ok = (x) => !!x && (x.kind === "clip" || (x.status === "approved" && !!x.take));
   return { prev: i > 0 && ok(act[i - 1]) ? act[i - 1] : null, next: i >= 0 && ok(act[i + 1]) ? act[i + 1] : null };
 }
 function chipOptions(s) {
-  const { prev, next } = chipSides(s);
+  const { prev, next } = chipNear(s);
   if (prev) return ["bridge", "context", "cut"];
   if (next) return ["bridge", "cut"];
   return ["cut"];
@@ -211,6 +231,7 @@ function chipPlan(s) {
   const j = chipJoin(s);
   if (j !== "bridge") return { alone: true, name: chipName(s, j) };
   const { prev, next } = chipSides(s);
+  if (!prev && !next) return { alone: true, name: "Continuous", pending: true };   // nothing approved to pin to yet
   const act = active(), i = act.indexOf(s), nx = act[i + 1];
   const joins = { [s.id]: prev ? "bridge" : "cut" };
   if (nx && isRendered(nx)) joins[nx.id] = next ? "bridge" : "cut";
@@ -257,7 +278,40 @@ function noteSeams(rows, chain, standalone) {
 }
 /** A run of the open project is going (another project's run doesn't lock this one). */
 const busyHere = () => !!P() && ((!!S.busy && S.busy.slug === P().slug) || (!!S.chunking && S.chunking.slug === P().slug));
-const renderingId = () => (busyHere() && S.busy && (S.busy.kind === "render" || S.busy.kind === "reroll") ? S.busy.target : null);
+/** The Shot being sampled now (0.8.3): Long Shot reports each piece as it
+ *  starts, so a run of several Shots (Render all) marks the one in progress,
+ *  not its last Shot. Before the first report: the first Shot it samples. */
+function renderingId() {
+  const b = S.busy;
+  if (!(busyHere() && b && (b.kind === "render" || b.kind === "reroll"))) return null;
+  if (!b.built) return b.target;
+  const chain = b.built.chain;
+  if (b.current && b.segs[b.current.segment] === "rendering") return b.current.id || chain[b.current.segment - 1] || b.target;
+  const waiting = runSampled(b).filter((id) => !segFinished(b, id));
+  return waiting[0] || b.target;
+}
+/** Shots this run samples, in order (not the ones that load their take). */
+function runSampled(b) {
+  return b.built.chain.filter((id) => { const x = shotById(id); return x && x.kind !== "clip" && x.status === "queued"; });
+}
+function segFinished(b, id) {
+  const st = b.segs[b.built.chain.indexOf(id) + 1];
+  return st === "done" || st === "reused";
+}
+/** A Shot's place in the run going now: "rendering" | "waiting" (with its
+ *  place after the one rendering) | "done" (sampled; its clip comes at the end) | null. */
+function runState(s) {
+  const b = S.busy;
+  if (!s || s.kind === "clip" || s.status !== "queued" || !busyHere() || !b || !b.built ||
+      !(b.kind === "render" || b.kind === "reroll") || !b.built.chain.includes(s.id)) return null;
+  if (segFinished(b, s.id)) return { state: "done" };
+  const rid = renderingId();
+  if (s.id === rid) return { state: "rendering" };
+  const order = runSampled(b), waiting = order.filter((id) => !segFinished(b, id) && id !== rid);
+  // "Up next" for the next one, then its place in the whole run ("3rd in this run")
+  return { state: "waiting", pos: waiting.indexOf(s.id) + 1, at: order.indexOf(s.id) + 1 };
+}
+const ORD = (n) => n + (n % 10 === 1 && n % 100 !== 11 ? "st" : n % 10 === 2 && n % 100 !== 12 ? "nd" : n % 10 === 3 && n % 100 !== 13 ? "rd" : "th");
 const clock = (iso) => (iso || "").slice(11, 16);
 
 /** Non-bypassed references whose file is gone (or never chosen). */
@@ -267,7 +321,9 @@ function missingRefs() {
     .map((s) => ({ label: titleOf(s) + "'s clip" }));
   const anchors = anchorKeys().filter((k) => anchorItem(k) && ["missing", "invalid"].includes(S.refState["anchor:" + k]))
     .map((k) => ({ label: anchorTitle(k) }));
-  return liveCast().filter((c) => !c.image || ["missing", "invalid"].includes(S.refState[c.id])).concat(clips, anchors);
+  const voices = liveVoices().filter((v) => ["missing", "invalid"].includes(S.refState["voice:" + v.id]))
+    .map((v) => ({ label: v.label || audioLabelOf(v) }));
+  return liveCast().filter((c) => !c.image || ["missing", "invalid"].includes(S.refState[c.id])).concat(clips, anchors, voices);
 }
 const audioMissing = () => !!P().audio.file && ["missing", "invalid"].includes(S.refState.audio);
 
@@ -423,6 +479,9 @@ async function checkInputs() {
   if (p.anchor_end && p.anchor_end.file) {
     files.push({ key: "anchor:end", name: p.anchor_end.file, subfolder: p.anchor_end.subfolder, sha256: p.anchor_end.sha256 });
   }
+  for (const v of p.voices || []) {
+    if (v.file) files.push({ key: "voice:" + v.id, name: v.file, subfolder: v.subfolder, sha256: v.sha256 });
+  }
   if (!files.length) { S.refState = {}; return; }
   let res;
   try { res = await api("/longshot/check-inputs", { method: "POST", body: { files } }); } catch (e) { return; }
@@ -431,7 +490,8 @@ async function checkInputs() {
   for (const f of res.files) {
     state[f.key] = f.state;
     S.refInfo[f.key] = f;
-    const item = f.key === "audio" ? p.audio : f.key.startsWith("clip:") || f.key.startsWith("anchor:") ? refItem(f.key) : p.cast.find((c) => c.id === f.key);
+    const item = f.key === "audio" ? p.audio : f.key.startsWith("clip:") || f.key.startsWith("anchor:") || f.key.startsWith("voice:")
+      ? refItem(f.key) : p.cast.find((c) => c.id === f.key);
     if (!item) continue;
     if (f.key.startsWith("anchor:")) {          // a frame anchor: just follow the file
       if (f.state === "ok" || f.state === "changed") { item.sha256 = f.sha256; item.size_bytes = f.size_bytes; adopted = adopted || f.state === "changed"; }
@@ -510,12 +570,14 @@ function refItem(key) {
   if (key === "audio") return p.audio;
   if (key.startsWith("clip:")) { const sh = p.shots.find((x) => x.id === key.slice(5)); return sh && sh.clip; }
   if (key.startsWith("anchor:")) return anchorItem(key.slice(7));
+  if (key.startsWith("voice:")) return voiceById(key.slice(6));
   return p.cast.find((c) => c.id === key);
 }
-function refName(key) { const it = refItem(key); return key === "audio" || key.startsWith("clip:") || key.startsWith("anchor:") ? it.file : it.image; }
+function refName(key) { const it = refItem(key); return key === "audio" || key.startsWith("clip:") || key.startsWith("anchor:") || key.startsWith("voice:") ? it.file : it.image; }
 function refLabel(key) {
   if (key === "audio") return "The song";
   if (key.startsWith("clip:")) { const sh = P().shots.find((x) => x.id === key.slice(5)); return sh ? `${titleOf(sh)}'s clip` : "A clip"; }
+  if (key.startsWith("voice:")) { const v = refItem(key); return v && v.label ? v.label : "A voice reference"; }
   const c = refItem(key);
   return c && c.label ? c.label : "A reference";
 }
@@ -1099,8 +1161,9 @@ function jobOpts(job) {
     if (sp.mode === "chip") {
       const plan = chipPlan(s);
       if (plan.alone) {
-        return { upto: s.id, kind: sp.kind, standalone: true, label: `${verb} Shot ${n} · ${plan.name}${seed}${take}`,
-          note: plan.name === "Context" ? "A hard cut · the last frame of the Shot before as a reference" : "A fresh start from the references",
+        return { upto: s.id, kind: sp.kind, standalone: true, label: `${verb} Shot ${n} · ${plan.pending ? "on its own" : plan.name}${seed}${take}`,
+          note: plan.name === "Context" ? "A hard cut · the last frame of the Shot before as a reference"
+            : plan.pending ? "On its own · no approved Shot next to it to continue from yet" : "A fresh start from the references",
           onDone: onRendered(s.id, true) };
       }
       const how = plan.prev && plan.next ? `from ${titleOf(plan.prev)} into ${titleOf(plan.next)}`
@@ -2042,7 +2105,7 @@ function onMessage(type, d) {
     case "progress":
       if (d.node === b.built.nodes.longshot || d.node === undefined) b.step = d.max ? d.value / d.max : 0;
       break;
-    case "mmh3.longshot": onSegment(b, d); break;
+    case "mmh3.longshot": onSegment(b, d); if (b.slug === (P() && P().slug)) refreshRunRows(b); break;
     case "execution_success": case "execution_error": case "execution_interrupted":
       finish(b.promptId); return;
     default: return;
@@ -2756,7 +2819,7 @@ function renderCast() {
       <div class="card-body">
         <div class="card-top"><span class="pic">${esc(pic)}</span>
           <button class="label-view" data-action="edit-cast" title="Edit label and description">${esc(c.label) || '<i class="muted">no label</i>'}</button></div>
-        ${badge ? `<div>${badge}</div>` : ""}
+        ${badge ? `<div>${badge}</div>` : ""}${voiceTag(c)}
         <button class="desc-view" data-action="edit-cast" title="Edit label and description">${esc(c.desc) || "<i>Add a description…</i>"}</button>
         <select data-relink="cast" aria-label="Reference image file">${inputOptions("images", c.subfolder, c.image, "Choose an image…")}</select>
         ${tools}
@@ -2767,8 +2830,101 @@ function renderCast() {
         <button class="icon x" data-action="remove-cast" title="Remove" aria-label="Remove ${esc(c.label)}">${CROSS}</button>
       </div></div>`;
   });
+  for (const v of P().voices || []) cards.push(voiceCard(v));
   cards.push(`<button class="addtile" data-action="add-cast" data-drop="add">${PLUS} <span>Add reference · ${esc(`<Picture ${n + 1}>`)}<br><span class="muted small">or drop images here</span></span></button>`);
+  const nextA = (P().audio.voice_ref ? 1 : 0) + liveVoices().length + 1;
+  cards.push(`<button class="addtile voice-add" data-action="add-voice">${PLUS} <span>Add audio reference · ${esc(`<Audio ${nextA}>`)}<br><span class="muted small">a voice timbre · or drop audio here</span></span></button>`);
   $("cast").innerHTML = cards.join("");
+}
+
+/** On a picture card: the voice reference it gets its voice timbre from. */
+function voiceTag(c) {
+  if (!c.voice) return "";
+  const v = voiceById(c.voice), a = audioLabelOf(v);
+  if (a) return `<div><span class="voice-tag" title="Gets its voice timbre from ${esc(a)}${v.label ? " " + esc(v.label) : ""}">🔊 ${esc(a)}</span></div>`;
+  return `<div><span class="voice-tag missing" title="Its voice reference is ${v ? "bypassed" : "removed"}, so the prompt leaves the voice out. Pick another in its editor.">🔊 voice ${v ? "off" : "removed"}</span></div>`;
+}
+
+/** An audio reference card: <Audio N>, label, player, trim. */
+function voiceCard(v) {
+  const a = audioLabelOf(v), state = S.refState["voice:" + v.id];
+  const missing = !!v.file && (state === "missing" || state === "invalid");
+  const who = liveCast().filter((c) => c.voice === v.id).map((c) => c.label || picOf(c));
+  const over = !v.bypassed && a && Number(a.match(/\d+/)[0]) > MAX_AUDIO_REFS;
+  const src = v.file && !missing ? viewURL({ filename: v.file, subfolder: v.subfolder, type: "input" }) : "";
+  const up = S.uploading["voice:" + v.id] ? '<div class="drop-busy">Uploading…</div>' : "";
+  return `<div class="card voice-card${v.bypassed ? " off" : ""}${missing && !v.bypassed ? " missing" : ""}" data-voice="${esc(v.id)}">${up}
+      <div class="thumb-col"><button class="thumb voice-thumb" data-action="voice-replace" title="Choose another audio file, or drop one on this card" aria-label="Replace the audio of ${esc(v.label || a || "this voice")}">♪</button></div>
+      <div class="card-body">
+        <div class="card-top"><span class="pic">${esc(v.bypassed ? "bypassed" : a || "—")}</span>
+          <input class="inline voice-label" data-voice-field="label" value="${esc(v.label)}" placeholder="<voice>" spellcheck="false" aria-label="Voice reference label"></div>
+        <div class="muted small">${over ? '<span class="warn">Long Shot takes 3 reference audios: bypass one.</span>'
+          : who.length ? `Voice timbre of ${esc(who.join(", "))}` : "Not linked yet: pick it in a picture's editor (gets its voice timbre from)."}</div>
+        ${missing ? `<div class="missing">Missing: ${esc(v.original_name || v.file)}</div>`
+          : src ? `<audio class="voice-play" controls preload="none" src="${esc(src)}"></audio>` : ""}
+        <div class="voice-trim">
+          <label class="lbl-row">Start <input type="number" min="0" step="0.1" data-voice-field="start" value="${esc(v.start || 0)}" style="width:64px"> s</label>
+          <label class="lbl-row">Length <input type="number" min="0" step="0.1" data-voice-field="length" value="${v.length ? esc(v.length) : ""}" placeholder="all" style="width:64px"> s</label>
+        </div>
+        <div class="muted small voice-file" title="${esc((v.subfolder ? v.subfolder + "/" : "") + v.file)}">${esc(v.original_name || v.file)}</div>
+      </div>
+      <div class="card-tools">
+        <button class="icon${v.bypassed ? " on" : ""}" data-action="bypass-voice" aria-pressed="${v.bypassed}" title="${v.bypassed ? "Turn back on" : "Bypass"}">${POWER}</button>
+        <button class="icon x" data-action="remove-voice" title="Remove" aria-label="Remove ${esc(v.label || "this voice reference")}">${CROSS}</button>
+      </div></div>`;
+}
+function voiceOf(el) { const c = el.closest("[data-voice]"); return c && voiceById(c.dataset.voice); }
+
+/** Dropping (or choosing) audio on Cast & Scenes: one voice reference per file,
+ *  or a new file for the card it was dropped on. */
+async function addVoices(fileList, targetId) {
+  const p = P();
+  const files = [...fileList].filter((x) => AUDIO_RE.test(x.name || ""));
+  if (!files.length) { toast("Drop an audio file for a voice reference (WAV, MP3, FLAC, OGG, M4A, AAC, Opus)."); return; }
+  if (setupGuard()) return;
+  const target = targetId ? voiceById(targetId) : null;
+  const list = target ? files.slice(0, 1) : files;
+  const cards = list.map((f) => {
+    if (target) return target;
+    const v = { id: uid("v"), label: "<" + (f.name || "voice").replace(/\.[^.]+$/, "").slice(0, 24) + ">", file: "", subfolder: "",
+      type: "input", original_name: "", sha256: null, size_bytes: null, start: 0, length: 0, bypassed: false };
+    p.voices.push(v);
+    return v;
+  });
+  cards.forEach((v) => { S.uploading["voice:" + v.id] = true; });
+  render();
+  const failed = [];
+  const uploaded = await Promise.all(list.map(async (f) => {
+    try { return await uploadFile(f, "audio"); } catch (e) { failed.push(`${f.name}: ${e.message}`); return null; }
+  }));
+  let changed = false;
+  uploaded.forEach((info, i) => {
+    const v = cards[i];
+    delete S.uploading["voice:" + v.id];
+    if (!info) { if (!target) p.voices.splice(p.voices.indexOf(v), 1); return; }
+    const same = !!v.sha256 && info.sha256 === v.sha256;
+    Object.assign(v, { file: info.name, subfolder: info.subfolder, original_name: info.name, sha256: info.sha256, size_bytes: info.size_bytes });
+    S.refState["voice:" + v.id] = "ok";
+    if (!same && !v.bypassed) changed = true;
+  });
+  await loadInputs();
+  if (changed) applyRefChange((await askRefChange()) || "keep", "Voice references");
+  commit();
+  const notes = [];
+  if (failed.length) notes.push(`Couldn't upload ${failed.join("; ")}`);
+  if (audioRefCount() > MAX_AUDIO_REFS) notes.push(`Long Shot takes ${MAX_AUDIO_REFS} reference audios (the song's voice counts as one): bypass some before rendering.`);
+  else if (!target && !failed.length) notes.push("Link it to a character: open the picture's editor and pick it under \"gets its voice timbre from\".");
+  if (notes.length) toast(notes.join(" "));
+}
+
+function pickVoices(targetId) {
+  if (setupGuard()) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "audio/*";
+  inp.multiple = !targetId;
+  inp.addEventListener("change", () => { if (inp.files.length) addVoices(inp.files, targetId); });
+  inp.click();
 }
 
 const STYLE_FIELDS = [["summary", "Summary", 2], ["retention", "Retention", 1], ["style_line", "Style line", 3],
@@ -2829,6 +2985,7 @@ const CHIP_HELP = {
   cut: "a fresh start from the references; nothing pinned.",
   context: "a hard cut; the last frame of the Shot before goes in as a reference picture (same characters, place and light).",
   from: "continues from the end of the Shot before; its end is free.",
+  pending: "continues from the Shot before in Render all. ▶ on this Shot alone pins it to the approved Shots next to it; with none approved yet it renders on its own.",
   into: "a fresh start that flows into the start of the Shot after.",
   bridge: "pinned at both ends: flows from the Shot before into the Shot after.",
 };
@@ -2836,14 +2993,18 @@ function chipKey(s) {
   const j = chipJoin(s);
   if (j !== "bridge") return j;
   const { prev, next } = chipSides(s);
-  return prev && next ? "bridge" : prev ? "from" : "into";
+  return prev && next ? "bridge" : prev ? "from" : next ? "into" : "pending";
 }
 
 /** The always-visible row of a (generated) Shot card: status, title, preview, tools. */
 function shotRowHTML(s) {
   const rid = renderingId();
+  const run = !s.bypassed ? runState(s) : null;
   const state = s.bypassed ? "bypassed" : s.id === rid ? "rendering" : s.status;
-  const L = LOOK[state];
+  const L0 = LOOK[state];
+  // in a run of several Shots: which one is sampling, which come next, which are done
+  const L = run && run.state === "waiting" ? Object.assign({}, L0, { label: run.pos === 1 ? "Up next" : `${ORD(run.at)} in this run` })
+    : run && run.state === "done" ? Object.assign({}, L0, { label: "Sampled · clip at the end", fg: "#9FE0C2" }) : L0;
   const title = s.bypassed ? "Bypassed" : "Shot " + numOf(s.id);
   const seed = !isAuto(s) ? String(s.shot_seed)
     : s.status !== "queued" && hasSeed(s.seed_used) ? `auto · ${s.seed_used}` : "auto";
@@ -2876,7 +3037,7 @@ function shotRowHTML(s) {
   const icon = { bridge: "↔", context: "⧉", cut: "|" }[cj];
   const joinChip = !s.bypassed && s.kind !== "clip"
     ? `<button class="join-chip j-${esc(cj)}${opts.length < 2 ? " only" : ""}" data-action="cycle-join" title="${esc(chipName(s) + ": " + CHIP_HELP[chipKey(s)])}${
-      opts.length < 2 ? " No approved Shot next to it, so Cut is the only choice." : ` Click to switch: ${opts.map((o) => chipName(s, o)).join(" → ")}.`}">${icon} ${chipName(s)}</button>` : "";
+      opts.length < 2 ? " No Shot next to it, so Cut is the only choice." : ` Click to switch: ${opts.map((o) => chipName(s, o)).join(" → ")}.`}">${icon} ${chipName(s)}</button>` : "";
   const ctxStale = s.join === "context" && s.status !== "queued" && s.context_from && prevR &&
     (prevR.kind === "clip" ? `clip:${prevR.id}` : prevR.take) !== s.context_from;
   const ctxFlag = ctxStale ? `<span class="flag cut" title="The Shot before has a different take now. Re-render ${title} to take its new last frame.">context changed</span>` : "";
@@ -2895,6 +3056,13 @@ function shotRowHTML(s) {
           <button class="icon lg${s.bypassed ? " on" : ""}" data-action="bypass-shot" aria-pressed="${s.bypassed}" title="${s.bypassed ? "Turn shot back on" : "Bypass shot"}">${POWER}</button>
           <button class="icon lg x" data-action="remove-shot" title="Remove" aria-label="Remove ${title}">${CROSS}</button>
         </div>`;
+}
+
+/** A run's progress moved on: the rows of the Shots in it (fields untouched). */
+function refreshRunRows(b) {
+  if (!b || !b.built) return;
+  for (const id of b.built.chain) { const x = shotById(id); if (x && x.kind !== "clip") refreshShotRow(x); }
+  renderViewer();
 }
 
 /** While typing: only the Shot's row changes, never its fields. */
@@ -3752,6 +3920,28 @@ document.addEventListener("click", async (e) => {
       break;
     }
     case "ref-step": stepRef(castOf(el), +el.dataset.dir); break;
+    case "add-voice": pickVoices(null); break;
+    case "voice-replace": { const v = voiceOf(el); if (v) pickVoices(v.id); break; }
+    case "bypass-voice": {
+      if (setupGuard()) return;
+      const v = voiceOf(el);
+      if (!v) return;
+      const mode = await askRefChange();
+      v.bypassed = !v.bypassed;
+      applyRefChange(mode, "Voice references");
+      commit();
+      break;
+    }
+    case "remove-voice": {
+      if (setupGuard()) return;
+      const v = voiceOf(el);
+      if (!v || !confirm(`Remove ${v.label || "this voice reference"}? Pictures linked to it lose their voice.`)) return;
+      const mode = await askRefChange();
+      p.voices = p.voices.filter((x) => x.id !== v.id);
+      if (!v.bypassed) applyRefChange(mode, "Voice references");
+      commit();
+      break;
+    }
     case "reset-seeds": resetShotSeeds(); break;
     case "free-vram": freeMemory("vram"); break;
     case "free-ram": freeMemory("ram"); break;
@@ -3946,6 +4136,17 @@ document.addEventListener("change", async (e) => {
   const changed = before === undefined || before !== el.value;
   committed.set(el, el.value);
   if (el.dataset.relink) { relinkFromSelect(el); return; }
+  if (el.dataset.voiceField) {
+    const v = voiceOf(el), k = el.dataset.voiceField;
+    if (!v) return;
+    if (setupGuard()) { render(); return; }
+    if (k === "label") { v.label = el.value; return commit(); }    // not in the prompt: nothing re-renders
+    const val = Math.max(0, Number(el.value) || 0);
+    if (val === Number(v[k] || 0)) return;
+    v[k] = val;
+    if (!v.bypassed) applyRefChange((await askRefChange()) || "keep", "Voice references");
+    return commit();
+  }
   if (el.id === "tl-export-up") { p.settings.export_upscale = el.checked; return commit(); }
   if (el.dataset.anchorFile !== undefined) {
     const k = el.closest("[data-anchor]");
@@ -4634,6 +4835,8 @@ function dropTargetOf(e) {
   }
   const cast = e.target.closest("#cast-panel");
   if (cast) {
+    const vc = e.target.closest("[data-voice]");
+    if (vc) return { zone: "cast", el: vc, id: null, voice: vc.dataset.voice };
     const card = e.target.closest("[data-cast]");
     return card ? { zone: "cast", el: card, id: card.dataset.cast }
       : { zone: "cast", el: cast.querySelector("[data-drop=add]") || cast, id: null };
@@ -4679,7 +4882,12 @@ window.addEventListener("drop", (e) => {
   const t = dropTargetOf(e);
   clearDrop();
   if (!t) return;
-  if (t.zone === "cast") addImages(e.dataTransfer.files, t.id);
+  if (t.zone === "cast") {
+    const fl = [...e.dataTransfer.files];
+    // audio files on Cast & Scenes are voice references (a voice card: replace its file)
+    if (t.voice || (fl.some((x) => AUDIO_RE.test(x.name || "")) && !fl.some(isImageFile))) addVoices(fl, t.voice || null);
+    else addImages(e.dataTransfer.files, t.id);
+  }
   else if (t.zone === "audio") addAudio(e.dataTransfer.files);
   else if (t.zone === "shots") addClipFiles(e.dataTransfer.files, t.id);
   else if (t.zone === "anchor") anchorUpload(t.id, e.dataTransfer.files);
@@ -4868,6 +5076,7 @@ function openEditor(c) {
   $("editor-pic").textContent = picOf(c);
   $("editor-label").value = c.label;
   $("editor-desc").value = c.desc;
+  fillEditorVoice(c);
   showEditorImage(c);
   $("editor").hidden = false;
   autoGrow($("editor-desc"));
@@ -4887,9 +5096,23 @@ function showEditorImage(c) {
     " · drop an image here to replace it" : "Drop an image here to use it";
 }
 
+/** "gets its voice timbre from": None, or one of the voice references. */
+function fillEditorVoice(c) {
+  const sel = $("editor-voice");
+  const vs = P().voices || [];
+  sel.innerHTML = `<option value="">None</option>` + vs.map((v) => {
+    const a = audioLabelOf(v);
+    return `<option value="${esc(v.id)}">${esc(a || "(off)")} ${esc(v.label || v.original_name || "")}</option>`;
+  }).join("") + (c.voice && !voiceById(c.voice) ? `<option value="${esc(c.voice)}">(removed)</option>` : "");
+  sel.value = c.voice || "";
+  $("editor-voice-row").classList.toggle("empty", !vs.length);
+  $("editor-voice-hint").textContent = vs.length ? "" : "Add an audio reference in Cast & Scenes first.";
+}
+
 function editorDirty() {
   const c = editing && P().cast.find((x) => x.id === editing.id);
-  return !!c && ($("editor-label").value !== c.label || $("editor-desc").value !== c.desc);
+  return !!c && ($("editor-label").value !== c.label || $("editor-desc").value !== c.desc ||
+    ($("editor-voice").value || null) !== (c.voice || null));
 }
 
 function closeEditor() { $("editor").hidden = true; editing = null; }
@@ -4902,6 +5125,7 @@ async function editorSave() {
   const mode = await askRefChange();
   c.label = $("editor-label").value;
   c.desc = $("editor-desc").value;
+  c.voice = $("editor-voice").value || null;
   if (!c.bypassed) applyRefChange(mode, "Cast & Scenes");
   closeEditor();
   commit();
@@ -5479,8 +5703,8 @@ function cycleJoin(s) {
   if (!s || listGuard(P().shots.indexOf(s))) return;
   const order = chipOptions(s);
   if (order.length < 2) {
-    toast(`${titleOf(s)} has no approved Shot next to it, so it renders on its own (Cut). ` +
-      "Approve the Shot before or after it for Continuous, Context or Bridge.");
+    toast(`${titleOf(s)} has no Shot next to it, so it renders on its own (Cut). ` +
+      "Add a Shot before or after it for Continuous or Context.");
     return;
   }
   const wasJ = chipJoin(s), was = chipName(s, wasJ);

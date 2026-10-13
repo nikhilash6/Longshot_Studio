@@ -126,9 +126,13 @@ class Env:
     """What the running ComfyUI has. None means 'unknown, assume yes'."""
     classes: set | None = None
     video_formats: list | None = None
+    shot_inputs: set | None = None      # MiniMax H3 Timeline Shot's optional inputs
 
     def has(self, cls: str) -> bool:
         return self.classes is None or cls in self.classes
+
+    def shot_takes(self, name: str) -> bool:
+        return self.shot_inputs is None or name in self.shot_inputs
 
 
 @dataclass
@@ -199,6 +203,34 @@ def videos_subfolder(project: dict) -> str:
 
 def active_cast(project: dict) -> list:
     return [c for c in project.get("cast") or [] if not c.get("bypassed")]
+
+
+MAX_AUDIO_REFS = 3          # Long Shot's ref_audios autogrow limit
+
+
+def active_voices(project: dict) -> list:
+    """Voice references (audio cards in Cast & Scenes) that are on and have a file."""
+    return [v for v in project.get("voices") or []
+            if isinstance(v, dict) and not v.get("bypassed") and v.get("file")]
+
+
+def audio_labels(project: dict) -> dict:
+    """{voice id: '<Audio N>'}. The song's vocals (Audio → Voice reference) take
+    <Audio 1> when that's on; voice references follow in card order."""
+    base = 1 if (project.get("audio") or {}).get("voice_ref") else 0
+    return {str(v.get("id")): f"<Audio {base + k + 1}>" for k, v in enumerate(active_voices(project))}
+
+
+def voice_retention(project: dict) -> list:
+    """retention_analysis lines for the voice references."""
+    labels, cast = audio_labels(project), active_cast(project)
+    out = []
+    for v in active_voices(project):
+        a = labels[str(v.get("id"))]
+        who = [c.get("label") or picture_label(k) for k, c in enumerate(cast) if c.get("voice") == v.get("id")]
+        out.append(f"{a} (voice timbre{' of ' + ', '.join(who) if who else ''}): reference - the voice "
+                   "timbre only; what is said comes from each Shot's dialogue.")
+    return out
 
 
 def picture_label(k: int) -> str:
@@ -436,7 +468,7 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
         need += ["VHS_LoadVideo", "MiniMaxH3Clip", "MiniMaxH3ClipShot"]
         if final and s.get("clip_pixels"):
             need.append("MiniMaxH3ClipPixels")
-    if a.get("lip_sync") or a.get("voice_ref") or a.get("final_override"):
+    if a.get("lip_sync") or a.get("voice_ref") or a.get("final_override") or active_voices(project):
         need.append("VHS_LoadAudioUpload")
     if a.get("lip_sync"):
         need.append("MiniMaxH3SongTrack")
@@ -589,6 +621,11 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                          f"{len(cast)} are on. Bypass some.")
     resize_px = _num(s.get("ref_resize_px", 1500), "Reference resize", 16, 8192, int)
     refs, subjects = {}, None
+    voice_of = audio_labels(project)
+    n_audio = len(voice_of) + (1 if (project.get("audio") or {}).get("voice_ref") else 0)
+    if n_audio > MAX_AUDIO_REFS:
+        raise BuildError(f"Long Shot takes at most {MAX_AUDIO_REFS} reference audios; {n_audio} are on "
+                         "(voice references, plus the song's voice when Voice reference is on). Bypass some.")
     for k, c in enumerate(cast):
         pic = picture_label(k)
         if not c.get("image"):
@@ -605,9 +642,10 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             width=resize_px, height=resize_px, upscale_method="nearest-exact",
             keep_proportion="resize", pad_color="0, 0, 0", crop_position="center",
             divisible_by=2, device="cpu")
+        voice = voice_of.get(str(c.get("voice") or ""))
         inputs = dict(label=c.get("label") or pic, description=c.get("desc", ""),
                       role=c.get("role") or "appearance", reference=pic,
-                      role_2="-", reference_2="")
+                      role_2="voice timbre" if voice else "-", reference_2=voice or "")
         if subjects is not None:
             inputs["subjects"] = subjects
         subjects = g.add(f"subject{k + 1}", "MiniMaxH3Subject", f"{pic} subject", **inputs)
@@ -634,6 +672,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
             shot.get("join") if shot.get("join") in ("bridge", "cut") else "bridge"
         text = shot.get("text", "")
         anchor_inputs = {}
+        own_retention = ""
         if not lock:
             # Frame anchors (Long Shot 1.6.7): the image at the join before this Shot and
             # the one after it. Each is this Shot's next <Picture N>, after the Cast.
@@ -664,13 +703,27 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                     raise BuildError(f"Shot {n}'s context frame: {err}") from None
                 anchor_inputs["context_image"] = g.add(f"context{n}", "LoadImage",
                                                        f"Shot {n} context (last frame before)", image=image)
-                lead = (f"Use <Picture {pic}> (the last frame of the shot before) as the reference for "
-                        "continuity: same characters, place, lighting and wardrobe. ") + lead
+                # reference only: never "continuity" or "last frame", which H3 reads as
+                # "open on this frame and carry on from it"
+                lead = (f"<Picture {pic}> is a reference for the characters, objects and surroundings only. "
+                        f"The shot does not begin from <Picture {pic}> and does not continue it: it opens "
+                        "on a new camera angle and composition. ") + lead
+                if not env.shot_takes("retention"):
+                    msg = ("H3 Long Shot 1.6.9 or later marks a Context picture as weak_reference in the "
+                           "retention section. Update it for Context Shots that don't open on that frame.")
+                    if msg not in warnings:
+                        warnings.append(msg)
+                else:
+                    own_retention = (f"<Picture {pic}> (reference for [Shot 1]): weak_reference - characters, "
+                                     "objects and surroundings only; not a frame anchor, new framing and "
+                                     "camera angle.")
             text = (lead + text + tail).strip()
         inputs = dict(shot_id=str(shot.get("id") or f"shot{n}"), seconds=seconds,
                       text=text,
                       shot_seed=_seed(shot.get("shot_seed", -1), f"Shot {n} seed"),
                       lock=lock, join=join, frames=frames, **anchor_inputs)
+        if own_retention:
+            inputs["retention"] = own_retention       # Long Shot 1.6.9: this Shot's own lines
         if shots is not None:
             inputs["shots"] = shots
         shots = g.add(f"shot{n}", "MiniMaxH3TimelineShot", f"[Shot {n}]", **inputs)
@@ -680,7 +733,8 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     builder_inputs = dict(
         subject_definitions="", task_type=types[0] if types[0] != "-" else "reference generation",
         task_type_2=types[1], task_type_3=types[2],
-        summary=style.get("summary", ""), retention_analysis=style.get("retention", ""),
+        summary=style.get("summary", ""),
+        retention_analysis="\n".join(x for x in [(style.get("retention") or "").strip(), *voice_retention(project)] if x),
         style_line=style.get("style_line", ""), detailed_description="",
         overall_soundscape=style.get("soundscape", ""),
         non_diegetic_music=style.get("music", ""), shots=shots)
@@ -720,6 +774,19 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                         or "Infinite Talk\\MelBandRoformer_fp16.safetensors")
             long_extra["ref_audios.ref_audio_0"] = g.add(
                 "vocals", "MelBandRoFormerSampler", "MelBand vocals", model=mel, audio=loader)
+
+    # voice references (audio cards in Cast & Scenes): <Audio N> after the song's vocals
+    base = 1 if voice else 0
+    for k, v in enumerate(active_voices(project)):
+        a_label = f"<Audio {base + k + 1}>"
+        try:
+            value = pj.input_path_value(v["file"], v.get("subfolder", ""))
+        except ValueError as err:
+            raise BuildError(f"{v.get('label') or a_label}: {err}") from None
+        long_extra[f"ref_audios.ref_audio_{base + k}"] = g.add(
+            f"voice{k + 1}", "VHS_LoadAudioUpload", f"{a_label} {v.get('label', '')}".strip(), audio=value,
+            start_time=_num(v.get("start", 0) or 0, f"{a_label} start", 0, 1e7),
+            duration=_num(v.get("length", 0) or 0, f"{a_label} length", 0, 1e7))
 
     # --- Long Shot ---------------------------------------------------------------
     long_shot = g.add("longshot", "MiniMaxH3LongShot", "MiniMax H3 Long Shot",

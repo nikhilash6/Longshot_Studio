@@ -682,3 +682,24 @@ textarea.fit { resize: none; overflow: hidden; line-height: 1.5; }
 /* join chip with one choice (no approved Shot next to it): Cut, quiet */
 .join-chip.only { opacity: .6; }
 .join-chip.only:hover { opacity: .85; }
+
+/* Voice references (audio cards in Cast & Scenes) */
+.voice-card .voice-thumb { width: 64px; height: 64px; display: flex; align-items: center; justify-content: center;
+  font-size: 26px; color: #8FD3F0; background: #16303D; border-radius: 6px; }
+.voice-card .voice-label { flex: 1; min-width: 0; font-weight: 600; font-size: 13px; }
+.voice-card .voice-play { width: 100%; height: 30px; margin: 6px 0 2px; }
+.voice-card .voice-trim { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--sub); }
+.voice-card .voice-trim input { background: var(--field); border: 1px solid var(--field-line); border-radius: 6px;
+  color: var(--text); padding: 3px 6px; font-size: 12px; }
+.voice-card .voice-file { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.voice-card .missing { color: #FFB4A8; font-size: 12px; }
+.voice-card .warn { color: #FFD08A; }
+.voice-tag { display: inline-block; font-size: 11px; color: #8FD3F0; border: 1px solid #2C5266; border-radius: 10px;
+  padding: 1px 8px; margin: 2px 0; background: rgba(143,211,240,.07); }
+.voice-tag.missing { color: #FFB4A8; border-color: #6B2E2E; background: transparent; }
+.addtile.voice-add { color: #8FD3F0; }
+.editor-voice { display: flex; align-items: center; gap: 10px; justify-content: flex-end; margin-top: auto; padding-top: 10px; flex-wrap: wrap; }
+.editor-voice label { color: #8FD3F0; font-size: 12px; }
+.editor-voice select { background: var(--field); border: 1px solid #2C5266; border-radius: 8px; color: var(--text);
+  padding: 8px 12px; font-size: 14px; min-width: 180px; }
+.editor-voice.empty select { opacity: .6; }

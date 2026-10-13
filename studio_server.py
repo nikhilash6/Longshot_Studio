@@ -251,8 +251,19 @@ def _timeline_has_context():
         return True
 
 
+def _timeline_shot_inputs():
+    """MiniMax H3 Timeline Shot's optional inputs (None: unknown, assume all)."""
+    try:
+        import nodes as comfy_nodes
+        cls = comfy_nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3TimelineShot")
+        return None if cls is None else set((cls.INPUT_TYPES().get("optional") or {}).keys())
+    except Exception:
+        return None
+
+
 def current_env():
-    return gb.Env(classes=set(_node_classes()), video_formats=video_formats())
+    return gb.Env(classes=set(_node_classes()), video_formats=video_formats(),
+                  shot_inputs=_timeline_shot_inputs())
 
 
 _READY = set()
