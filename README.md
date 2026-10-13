@@ -27,11 +27,12 @@ never thrown away.
 - Upscale the final film in chunks with flat RAM, with an optional ProRes 422 HQ master.
 - Export or import a whole project as one .zip.
 
-<img width="2192" height="1338" alt="image" src="https://github.com/user-attachments/assets/a4574e50-346c-4ebf-b4c2-5d6ed81e827c" />
+<img width="2166" height="1493" alt="image" src="https://github.com/user-attachments/assets/543bc5fd-05bf-45dd-9557-f36327e8c935" />
 
-## What's new in 0.8.2
 
-Needs H3 Long Shot **1.6.8 or later** (unchanged). Replace the folder, restart ComfyUI, then
+## What's new in 0.8.3
+
+Needs H3 Long Shot **1.6.9 or later** (unchanged). Replace the folder, restart ComfyUI, then
 hard-refresh the Studio tab.
 
 **Join chip**
@@ -42,7 +43,7 @@ hard-refresh the Studio tab.
    Bridge is pinned at both ends. The Shots around it keep their takes.
 4. The yellow ▶ (another take) uses the same chip choice.
 5. The separate Bridge button is gone: the chip does it.
-
+6. added audio reference cards
 
 
 ## Requirements
