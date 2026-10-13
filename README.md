@@ -54,7 +54,7 @@ hard-refresh the Studio tab.
 | Pack | Needed for |
 |---|---|
 | [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) | Shot, Subject, Ref Prompt Builder r2v (always) |
-| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.6.8 or later** | rendering; adds the timeline mode (takes, locks, pins), Clip Shots, and the Take, Upscale Chunk and Save Audio nodes the Studio uses (always) |
+| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.6.9 or later** | rendering; adds the timeline mode (takes, locks, pins), Clip Shots, and the Take, Upscale Chunk and Save Audio nodes the Studio uses (always) |
 | [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | resizing references, optional Sage attention (always) |
 | [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) | saving the video, loading audio (always) |
 | [ComfyUI-MiniMax-H3-Turbo](https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo) | only when Turbo is on |
